@@ -318,8 +318,19 @@ async fn add_custom_publisher(
         .build()
         .map_err(|e| e.to_string())?;
 
+    // Normalise: accept bare domains like "bbc.com" or "//bbc.com"
+    let url = if url.starts_with("http://") || url.starts_with("https://") {
+        url
+    } else if url.starts_with("//") {
+        format!("https:{}", url)
+    } else {
+        format!("https://{}", url.trim_start_matches('/'))
+    };
+
     let resp = client.get(&url).send().await
         .map_err(|e| format!("Could not reach URL: {}", e))?;
+    // Use the final URL after any redirects (e.g. bbc.com → bbc.co.uk)
+    let final_url = resp.url().to_string();
     let content_type = resp.headers()
         .get(reqwest::header::CONTENT_TYPE)
         .and_then(|v| v.to_str().ok())
@@ -329,11 +340,13 @@ async fn add_custom_publisher(
 
     // 1. Try parsing the URL directly as RSS/Atom.
     let (feed_url, feed) = if let Ok(f) = feed_rs::parser::parse(&bytes[..]) {
-        (url.clone(), f)
+        (final_url.clone(), f)
     } else if content_type.contains("html") || content_type.is_empty() {
-        // 2. It looks like HTML — scan for <link rel="alternate" type="application/...feed...">
+        // 2. Scan for <link rel="alternate" type="application/rss+xml|atom+xml">
         let html = String::from_utf8_lossy(&bytes);
-        let discovered = discover_feed_url(&html, &url);
+        let discovered = discover_feed_url(&html, &final_url)
+            // 3. Fallback: probe well-known feed paths in parallel
+            .or(probe_common_feed_paths(&client, &final_url).await);
         match discovered {
             Some(feed_url) => {
                 let resp2 = client.get(&feed_url).send().await
@@ -344,7 +357,7 @@ async fn add_custom_publisher(
                 (feed_url, f)
             }
             None => return Err(
-                "No RSS/Atom feed found at this URL. Try finding the site's /feed or /rss URL directly.".to_string()
+                "No RSS/Atom feed found. Try pasting the direct feed URL (e.g. bbc.co.uk/news/rss.xml).".to_string()
             ),
         }
     } else {
@@ -408,6 +421,45 @@ fn discover_feed_url(html: &str, base_url: &str) -> Option<String> {
         search = end;
     }
     None
+}
+
+/// Try well-known feed paths on the same origin in parallel.
+/// Returns the first URL that responds with a valid RSS/Atom feed.
+async fn probe_common_feed_paths(client: &reqwest::Client, base_url: &str) -> Option<String> {
+    let origin = base_url.splitn(4, '/').take(3).collect::<Vec<_>>().join("/");
+    let origin = origin.trim_end_matches('/');
+    let paths = [
+        "/feed",
+        "/rss",
+        "/rss.xml",
+        "/feed.xml",
+        "/feeds/rss.xml",
+        "/atom.xml",
+        "/index.xml",
+        "/news/rss.xml",
+        "/feeds/all.rss.xml",
+    ];
+
+    let futs: Vec<_> = paths.iter().map(|path| {
+        let probe = format!("{}{}", origin, path);
+        let client = client.clone();
+        async move {
+            if let Ok(resp) = client.get(&probe).send().await {
+                if resp.status().is_success() {
+                    if let Ok(bytes) = resp.bytes().await {
+                        if feed_rs::parser::parse(&bytes[..]).is_ok() {
+                            return Some(probe);
+                        }
+                    }
+                }
+            }
+            None
+        }
+    }).collect();
+
+    let results = futures::future::join_all(futs).await;
+    // Return in path-order so we prefer /feed over /rss.xml etc.
+    results.into_iter().find_map(|r| r)
 }
 
 fn extract_attr(tag: &str, attr: &str) -> Option<String> {

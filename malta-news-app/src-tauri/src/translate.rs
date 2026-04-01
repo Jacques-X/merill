@@ -1,5 +1,4 @@
 use anyhow::{Context, Result};
-use std::collections::HashSet;
 
 use crate::models::RawArticle;
 
@@ -57,60 +56,42 @@ async fn try_translate(client: &reqwest::Client, text: &str, from: &str, to: &st
     Ok(result)
 }
 
-/// Batch-translate a set of articles (by index) with given language pair.
-async fn translate_batch(
+/// Translate a list of (index, headline) pairs. Returns (index, translated) pairs.
+/// Preserves chunk-of-10 batching to avoid rate limiting.
+async fn translate_tasks(
     client: &reqwest::Client,
-    articles: &mut [RawArticle],
-    indices: &[usize],
+    tasks: Vec<(usize, String)>,
     from: &str,
     to: &str,
-) {
-    if indices.is_empty() {
-        return;
-    }
-    log::info!("translating {} headlines ({} -> {})", indices.len(), from, to);
-
-    for chunk in indices.chunks(10) {
+) -> Vec<(usize, String)> {
+    let mut results = Vec::with_capacity(tasks.len());
+    for chunk in tasks.chunks(10) {
         let futs: Vec<_> = chunk
             .iter()
-            .map(|&i| {
-                let headline = articles[i].original_headline.clone();
+            .map(|(i, headline)| {
                 let client = client.clone();
+                let headline = headline.clone();
                 let from = from.to_string();
                 let to = to.to_string();
-                async move { translate_text(&client, &headline, &from, &to).await }
+                let i = *i;
+                async move {
+                    let translated = translate_text(&client, &headline, &from, &to)
+                        .await
+                        .unwrap_or_else(|e| {
+                            log::warn!("translation failed for {:?}: {}", &headline, e);
+                            headline.clone()
+                        });
+                    (i, translated)
+                }
             })
             .collect();
-
-        let results = futures::future::join_all(futs).await;
-        for (&idx, result) in chunk.iter().zip(results) {
-            match result {
-                Ok(translated) => {
-                    log::debug!(
-                        "translated: {:?} -> {:?}",
-                        &articles[idx].original_headline,
-                        &translated
-                    );
-                    articles[idx].translated_headline = translated;
-                }
-                Err(e) => {
-                    log::warn!(
-                        "translation failed for {:?}: {}",
-                        &articles[idx].original_headline,
-                        e
-                    );
-                    // Fallback: use original headline
-                    articles[idx].translated_headline =
-                        articles[idx].original_headline.clone();
-                }
-            }
-        }
+        results.extend(futures::future::join_all(futs).await);
     }
+    results
 }
 
 /// Translate all article headlines to the other language.
-/// - Maltese articles get English translations (for clustering + EN display)
-/// - English articles get Maltese translations (for MT display)
+/// MT→EN and EN→MT run concurrently. Articles with a non-empty translated_headline are skipped.
 pub async fn translate_headlines(articles: &mut [RawArticle]) {
     let client = reqwest::Client::builder()
         .user_agent("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15")
@@ -118,41 +99,40 @@ pub async fn translate_headlines(articles: &mut [RawArticle]) {
         .build()
         .unwrap();
 
-    let mt_indices: Vec<usize> = articles
+    // Snapshot (index, headline) pairs — releases immutable borrow before we write results back
+    let mt_tasks: Vec<(usize, String)> = articles
         .iter()
         .enumerate()
         .filter(|(_, a)| a.language == "mt" && a.translated_headline.is_empty())
-        .map(|(i, _)| i)
+        .map(|(i, a)| (i, a.original_headline.clone()))
         .collect();
 
-    let en_indices: Vec<usize> = articles
+    let en_tasks: Vec<(usize, String)> = articles
         .iter()
         .enumerate()
         .filter(|(_, a)| a.language == "en" && a.translated_headline.is_empty())
-        .map(|(i, _)| i)
+        .map(|(i, a)| (i, a.original_headline.clone()))
         .collect();
 
-    // MT -> EN first (needed for clustering)
-    translate_batch(&client, articles, &mt_indices, "mt", "en").await;
-    // EN -> MT (for Maltese UI display)
-    translate_batch(&client, articles, &en_indices, "en", "mt").await;
+    let total = mt_tasks.len() + en_tasks.len();
+    if total == 0 {
+        return;
+    }
+    log::info!("translating {} mt->en + {} en->mt headlines concurrently", mt_tasks.len(), en_tasks.len());
 
-    // Use HashSet for O(1) membership checks
-    let mt_set: HashSet<usize> = mt_indices.into_iter().collect();
-    let en_set: HashSet<usize> = en_indices.into_iter().collect();
+    // Run both directions concurrently
+    let (mt_results, en_results) = futures::future::join(
+        translate_tasks(&client, mt_tasks, "mt", "en"),
+        translate_tasks(&client, en_tasks, "en", "mt"),
+    ).await;
 
-    let total = mt_set.len() + en_set.len();
-    let translated = articles
-        .iter()
-        .enumerate()
-        .filter(|(i, a)| {
-            (mt_set.contains(i) || en_set.contains(i))
-                && a.translated_headline != a.original_headline
-        })
+    let translated_count = mt_results.iter().chain(en_results.iter())
+        .filter(|(i, t)| t != &articles[*i].original_headline)
         .count();
-    log::info!(
-        "translation complete: {}/{} headlines translated",
-        translated,
-        total
-    );
+
+    for (idx, t) in mt_results.into_iter().chain(en_results) {
+        articles[idx].translated_headline = t;
+    }
+
+    log::info!("translation complete: {}/{} headlines translated", translated_count, total);
 }

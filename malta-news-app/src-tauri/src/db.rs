@@ -143,6 +143,21 @@ pub fn delete_custom_publisher(conn: &Connection, id: &str) -> Result<()> {
 
 // ── CRUD Operations ──────────────────────────────────────────────────────────
 
+/// Return the subset of `ids` that already exist in the articles table.
+pub fn get_existing_article_ids(conn: &Connection, ids: &[&str]) -> Result<std::collections::HashSet<String>> {
+    if ids.is_empty() {
+        return Ok(std::collections::HashSet::new());
+    }
+    let placeholders: String = (1..=ids.len()).map(|i| format!("?{}", i)).collect::<Vec<_>>().join(",");
+    let sql = format!("SELECT id FROM articles WHERE id IN ({})", placeholders);
+    let mut stmt = conn.prepare(&sql)?;
+    let existing = stmt
+        .query_map(rusqlite::params_from_iter(ids.iter()), |row| row.get(0))?
+        .filter_map(|r| r.ok())
+        .collect();
+    Ok(existing)
+}
+
 /// Insert an article if it doesn't already exist. Returns true if inserted.
 pub fn insert_article(conn: &Connection, a: &RawArticle) -> Result<bool> {
     let changed = conn.execute(

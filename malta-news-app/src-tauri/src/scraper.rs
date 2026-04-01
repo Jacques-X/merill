@@ -159,15 +159,14 @@ pub fn extract_meta_image(html: &str) -> Option<String> {
 fn build_client() -> reqwest::Client {
     reqwest::Client::builder()
         .user_agent("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.0 Safari/605.1.15")
-        .timeout(std::time::Duration::from_secs(15))
+        .timeout(std::time::Duration::from_secs(8))
         .build()
         .expect("failed to build HTTP client")
 }
 
 // ── RSS scraping ────────────────────────────────────────────────────────────
 
-async fn fetch_rss(publisher: &PublisherDef, rss_url: &str) -> Result<Vec<RawArticle>> {
-    let client = build_client();
+async fn fetch_rss(client: &reqwest::Client, publisher: &PublisherDef, rss_url: &str) -> Result<Vec<RawArticle>> {
     let resp = client
         .get(rss_url)
         .send()
@@ -276,6 +275,7 @@ async fn fetch_rss(publisher: &PublisherDef, rss_url: &str) -> Result<Vec<RawArt
 // ── HTML scraping ───────────────────────────────────────────────────────────
 
 async fn fetch_html(
+    client: &reqwest::Client,
     publisher: &PublisherDef,
     url: &str,
     article_sel: &str,
@@ -284,7 +284,6 @@ async fn fetch_html(
     link_attr: &str,
     base_url: &str,
 ) -> Result<Vec<RawArticle>> {
-    let client = build_client();
     let resp = client
         .get(url)
         .send()
@@ -500,8 +499,7 @@ pub fn extract_body_text(html: &str) -> String {
     }
 }
 
-async fn fetch_sitemap(publisher: &PublisherDef, sitemap_url: &str) -> Result<Vec<RawArticle>> {
-    let client = build_client();
+async fn fetch_sitemap(client: &reqwest::Client, publisher: &PublisherDef, sitemap_url: &str) -> Result<Vec<RawArticle>> {
     let resp = client
         .get(sitemap_url)
         .send()
@@ -602,9 +600,9 @@ fn extract_xml_tag(xml: &str, tag: &str) -> Option<String> {
     }
 }
 
-async fn fetch_publisher(publisher: &PublisherDef) -> Result<Vec<RawArticle>> {
+async fn fetch_publisher(client: &reqwest::Client, publisher: &PublisherDef) -> Result<Vec<RawArticle>> {
     match &publisher.scrape {
-        ScrapeMethod::Rss { url } => fetch_rss(publisher, url).await,
+        ScrapeMethod::Rss { url } => fetch_rss(client, publisher, url).await,
         ScrapeMethod::Html {
             url,
             article_sel,
@@ -614,6 +612,7 @@ async fn fetch_publisher(publisher: &PublisherDef) -> Result<Vec<RawArticle>> {
             base_url,
         } => {
             fetch_html(
+                client,
                 publisher,
                 url,
                 article_sel,
@@ -624,13 +623,12 @@ async fn fetch_publisher(publisher: &PublisherDef) -> Result<Vec<RawArticle>> {
             )
             .await
         }
-        ScrapeMethod::Sitemap { url } => fetch_sitemap(publisher, url).await,
+        ScrapeMethod::Sitemap { url } => fetch_sitemap(client, publisher, url).await,
     }
 }
 
 /// Scrape a user-added RSS feed (no static PublisherDef required).
-async fn fetch_rss_dynamic(id: &str, rss_url: &str) -> Result<Vec<RawArticle>> {
-    let client = build_client();
+async fn fetch_rss_dynamic(client: &reqwest::Client, id: &str, rss_url: &str) -> Result<Vec<RawArticle>> {
     let resp = client
         .get(rss_url)
         .send()
@@ -690,9 +688,10 @@ async fn fetch_rss_dynamic(id: &str, rss_url: &str) -> Result<Vec<RawArticle>> {
 /// Scrape all publishers in parallel.
 /// Returns (articles, failed_publisher_ids).
 pub async fn scrape_all(custom_pubs: &[CustomPublisherDef]) -> (Vec<RawArticle>, Vec<String>) {
+    let client = build_client();
     let publishers = all_publisher_defs();
-    let static_futures: Vec<_> = publishers.iter().map(|p| fetch_publisher(p)).collect();
-    let custom_futures: Vec<_> = custom_pubs.iter().map(|p| fetch_rss_dynamic(&p.id, &p.rss_url)).collect();
+    let static_futures: Vec<_> = publishers.iter().map(|p| fetch_publisher(&client, p)).collect();
+    let custom_futures: Vec<_> = custom_pubs.iter().map(|p| fetch_rss_dynamic(&client, &p.id, &p.rss_url)).collect();
 
     let (static_results, custom_results) = futures::future::join(
         futures::future::join_all(static_futures),

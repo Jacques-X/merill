@@ -24,19 +24,26 @@ fn process(
 ) -> Result<PipelineResult> {
     let scraped_count = raw_articles.len();
 
-    // 1. Store new articles (with translated headlines).
+    // 1. Store new articles (with translated headlines) in a single transaction.
     let new_articles = {
         let conn = db.lock().unwrap();
-        let mut new = Vec::new();
-        for a in &raw_articles {
-            if db::insert_article(&conn, a)? {
-                if !a.translated_headline.is_empty() {
-                    db::set_translated_headline(&conn, &a.id, &a.translated_headline)?;
+        conn.execute_batch("BEGIN")?;
+        let result: Result<Vec<crate::models::RawArticle>> = (|| {
+            let mut new = Vec::new();
+            for a in &raw_articles {
+                if db::insert_article(&conn, a)? {
+                    if !a.translated_headline.is_empty() {
+                        db::set_translated_headline(&conn, &a.id, &a.translated_headline)?;
+                    }
+                    new.push(a.clone());
                 }
-                new.push(a.clone());
             }
+            Ok(new)
+        })();
+        match result {
+            Ok(new) => { conn.execute_batch("COMMIT")?; new }
+            Err(e) => { let _ = conn.execute_batch("ROLLBACK"); return Err(e); }
         }
-        new
     };
     drop(raw_articles);
 
@@ -154,6 +161,21 @@ pub async fn run(db: &Mutex<Connection>) -> Result<PipelineResult> {
 
     let (mut raw_articles, failed_sources) = scraper::scrape_all(&custom_pubs).await;
     log::info!("scraped {} articles total", raw_articles.len());
+
+    // Mark already-stored articles so translate_headlines skips them
+    {
+        let conn = db.lock().unwrap();
+        let ids: Vec<&str> = raw_articles.iter().map(|a| a.id.as_str()).collect();
+        if let Ok(existing) = db::get_existing_article_ids(&conn, &ids) {
+            let skipped = existing.len();
+            for a in &mut raw_articles {
+                if existing.contains(&a.id) {
+                    a.translated_headline = a.original_headline.clone();
+                }
+            }
+            log::info!("skipping translation for {} already-stored articles", skipped);
+        }
+    }
 
     translate::translate_headlines(&mut raw_articles).await;
 

@@ -402,20 +402,18 @@ export function FeedScreen({
 
     let arr = [...rawClusters];
 
-    // Apply tab filter.
-    if (filter === "local") {
-      arr = arr.filter(c => c.articles.every(a => a.category !== "international"));
-    } else {
-      arr = arr.filter(c => c.articles.some(a => a.category === "international"));
-    }
-
-    // Apply publisher filter for the active tab.
+    // Restrict each cluster to articles matching the active tab's locality,
+    // then drop clusters that have no articles left.
     const disabledPubs = filter === "local" ? localDisabledPublisherIds : globalDisabledPublisherIds;
-    if (disabledPubs.length > 0) {
-      arr = arr
-        .map(c => ({ ...c, articles: c.articles.filter(a => !disabledPubs.includes(a.publisher_id)) }))
-        .filter(c => c.articles.length > 0);
-    }
+    arr = arr
+      .map(c => ({
+        ...c,
+        articles: c.articles.filter(a =>
+          (filter === "local" ? !a.publisher.is_global : a.publisher.is_global) &&
+          !disabledPubs.includes(a.publisher_id)
+        ),
+      }))
+      .filter(c => c.articles.length > 0);
 
     // Apply category filter.
     if (activeCategory !== "all") {
@@ -556,17 +554,19 @@ function SourceRow({
   action,
   onAction,
   isLast,
+  dimmed = false,
 }: {
   publisher: import("@/types").Publisher;
   action: "remove" | "add" | "delete";
   onAction: () => void;
   isLast: boolean;
+  dimmed?: boolean;
 }) {
   const dotColor = (BIAS_COLORS as Record<string, string>)[publisher.bias_category] ?? "#8E8E93";
   return (
     <div
       className="settings-row"
-      style={{ borderBottom: isLast ? "none" : "0.5px solid var(--color-separator)" }}
+      style={{ borderBottom: isLast ? "none" : "0.5px solid var(--color-separator)", opacity: dimmed ? 0.5 : 1 }}
     >
       <div className="publisher-row-info">
         <span className="publisher-dot" style={{ background: dotColor }} />
@@ -596,35 +596,24 @@ function SourcesSection({
   onToggle: (id: string) => void;
   onDelete?: (id: string) => void;
 }) {
-  const active = publishers.filter(p => isEnabled(p.id));
-  const disabled = publishers.filter(p => !isEnabled(p.id));
-
+  const sorted = [...publishers].sort((a, b) => a.name.localeCompare(b.name));
   return (<>
     <p className="settings-label" style={{ marginTop: 28 }}>{label}</p>
-    {active.length > 0 && (
+    {sorted.length > 0 && (
       <div className="settings-group">
-        {active.map((p, i) => (
-          <SourceRow
-            key={p.id}
-            publisher={p}
-            action={onDelete ? "delete" : "remove"}
-            onAction={() => onDelete ? onDelete(p.id) : onToggle(p.id)}
-            isLast={i === active.length - 1}
-          />
-        ))}
-      </div>
-    )}
-    {disabled.length > 0 && (
-      <div className="settings-group" style={{ marginTop: 10, opacity: 0.75 }}>
-        {disabled.map((p, i) => (
-          <SourceRow
-            key={p.id}
-            publisher={p}
-            action="add"
-            onAction={() => onToggle(p.id)}
-            isLast={i === disabled.length - 1}
-          />
-        ))}
+        {sorted.map((p, i) => {
+          const enabled = isEnabled(p.id);
+          return (
+            <SourceRow
+              key={p.id}
+              publisher={p}
+              action={onDelete ? "delete" : (enabled ? "remove" : "add")}
+              onAction={() => onDelete ? onDelete(p.id) : onToggle(p.id)}
+              isLast={i === sorted.length - 1}
+              dimmed={!onDelete && !enabled}
+            />
+          );
+        })}
       </div>
     )}
   </>);
@@ -661,7 +650,7 @@ function AddSourceForm({ isGlobal, onAdded }: { isGlobal: boolean; onAdded: () =
     <form onSubmit={handleSubmit} className="add-source-form">
       <input
         className="add-source-input"
-        type="url"
+        type="text"
         placeholder={t(lang, "addSourceUrl")}
         value={url}
         onChange={e => setUrl(e.target.value)}
@@ -692,8 +681,8 @@ export function SettingsScreen() {
   const queryClient = useQueryClient();
   const { data: publishers = [] } = usePublishers();
 
-  const localPublishers = publishers.filter(p => !p.is_global);
-  const globalPublishers = publishers.filter(p => p.is_global);
+  const localPublishers = publishers.filter(p => !p.is_global).sort((a, b) => a.name.localeCompare(b.name));
+  const globalPublishers = publishers.filter(p => p.is_global).sort((a, b) => a.name.localeCompare(b.name));
 
   const invalidatePublishers = () => queryClient.invalidateQueries({ queryKey: ["publishers"] });
 
