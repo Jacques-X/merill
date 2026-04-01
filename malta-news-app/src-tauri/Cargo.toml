@@ -1,0 +1,36 @@
+[package]
+name = "habbar"
+version = "0.1.0"
+description = "Malta news aggregator with on-device bias analysis"
+authors = ["you"]
+license = ""
+repository = ""
+edition = "2021"
+rust-version = "1.77.2"
+
+[lib]
+name = "app_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2.5.6", features = [] }
+
+[dependencies]
+tauri = { version = "2.10.3", features = [] }
+tauri-plugin-log = "2"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+log = "0.4"
+anyhow = "1.0"
+tokio = { version = "1", features = ["rt", "macros"] }
+chrono = { version = "0.4", features = ["serde"] }
+uuid = { version = "1", features = ["v4", "serde"] }
+sha2 = "0.10"
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
+feed-rs = "2"
+rusqlite = { version = "0.32", features = ["bundled"] }
+tauri-plugin-opener = "2"
+hex = "0.4"
+scraper = "0.22"
+futures = "0.3"
+html-escape = "0.2"

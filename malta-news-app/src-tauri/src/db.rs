@@ -1,0 +1,384 @@
+use anyhow::Result;
+use rusqlite::{params, Connection};
+
+use crate::models::{CustomPublisherDef, RawArticle};
+
+// ── Database Setup & Migrations ──────────────────────────────────────────────
+
+pub fn open(path: &std::path::Path) -> Result<Connection> {
+    let conn = Connection::open(path)?;
+    conn.execute_batch(
+        "
+        PRAGMA journal_mode = WAL;
+        PRAGMA foreign_keys = ON;
+
+        CREATE TABLE IF NOT EXISTS articles (
+            id            TEXT PRIMARY KEY,
+            publisher_id  TEXT NOT NULL,
+            original_url  TEXT NOT NULL UNIQUE,
+            headline      TEXT NOT NULL,
+            translated_headline TEXT DEFAULT '',
+            snippet       TEXT DEFAULT '',
+            body_text     TEXT DEFAULT '',
+            image_url     TEXT DEFAULT '',
+            language      TEXT DEFAULT 'en',
+            published_at  TEXT NOT NULL,
+            cluster_id    TEXT,
+            embedding     BLOB,
+            category      TEXT DEFAULT 'general'
+        );
+
+        CREATE TABLE IF NOT EXISTS clusters (
+            id               TEXT PRIMARY KEY,
+            headline         TEXT NOT NULL,
+            first_reported   TEXT NOT NULL,
+            last_updated     TEXT NOT NULL,
+            is_blindspot     INTEGER DEFAULT 0,
+            ai_headline      TEXT DEFAULT '',
+            ai_summary       TEXT DEFAULT ''
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_articles_cluster ON articles(cluster_id);
+        CREATE INDEX IF NOT EXISTS idx_articles_published ON articles(published_at);
+
+        CREATE TABLE IF NOT EXISTS custom_publishers (
+            id       TEXT PRIMARY KEY,
+            name     TEXT NOT NULL,
+            rss_url  TEXT NOT NULL UNIQUE,
+            is_global INTEGER NOT NULL DEFAULT 0
+        );
+        ",
+    )?;
+
+    // Migration: add translated_headline column if missing
+    let has_col: bool = conn
+        .prepare("SELECT translated_headline FROM articles LIMIT 0")
+        .is_ok();
+    if !has_col {
+        conn.execute_batch(
+            "ALTER TABLE articles ADD COLUMN translated_headline TEXT DEFAULT ''",
+        )?;
+        log::info!("migrated: added translated_headline column");
+    }
+
+    // Migration: add body_text column if missing
+    let has_body: bool = conn
+        .prepare("SELECT body_text FROM articles LIMIT 0")
+        .is_ok();
+    if !has_body {
+        conn.execute_batch(
+            "ALTER TABLE articles ADD COLUMN body_text TEXT DEFAULT ''",
+        )?;
+        log::info!("migrated: added body_text column");
+    }
+
+    // Migration: add embedding column for fastembed vectors if missing
+    let has_embedding: bool = conn
+        .prepare("SELECT embedding FROM articles LIMIT 0")
+        .is_ok();
+    if !has_embedding {
+        conn.execute_batch(
+            "ALTER TABLE articles ADD COLUMN embedding BLOB",
+        )?;
+        log::info!("migrated: added embedding column");
+    }
+
+    // Migration: add category column if missing
+    let has_category: bool = conn
+        .prepare("SELECT category FROM articles LIMIT 0")
+        .is_ok();
+    if !has_category {
+        conn.execute_batch(
+            "ALTER TABLE articles ADD COLUMN category TEXT DEFAULT 'general'",
+        )?;
+        log::info!("migrated: added category column");
+    }
+
+    // Migration: add ai_headline / ai_summary to clusters if missing
+    let has_ai: bool = conn
+        .prepare("SELECT ai_headline FROM clusters LIMIT 0")
+        .is_ok();
+    if !has_ai {
+        conn.execute_batch(
+            "ALTER TABLE clusters ADD COLUMN ai_headline TEXT DEFAULT '';
+             ALTER TABLE clusters ADD COLUMN ai_summary  TEXT DEFAULT '';",
+        )?;
+        log::info!("migrated: added ai_headline, ai_summary to clusters");
+    }
+
+    Ok(conn)
+}
+
+// ── Custom Publishers ────────────────────────────────────────────────────────
+
+pub fn insert_custom_publisher(conn: &Connection, p: &CustomPublisherDef) -> Result<()> {
+    conn.execute(
+        "INSERT OR REPLACE INTO custom_publishers (id, name, rss_url, is_global) VALUES (?1, ?2, ?3, ?4)",
+        params![p.id, p.name, p.rss_url, p.is_global as i32],
+    )?;
+    Ok(())
+}
+
+pub fn get_custom_publishers(conn: &Connection) -> Result<Vec<CustomPublisherDef>> {
+    let mut stmt = conn.prepare(
+        "SELECT id, name, rss_url, is_global FROM custom_publishers ORDER BY name",
+    )?;
+    let rows = stmt.query_map([], |row| {
+        Ok(CustomPublisherDef {
+            id: row.get(0)?,
+            name: row.get(1)?,
+            rss_url: row.get(2)?,
+            is_global: row.get::<_, i32>(3)? != 0,
+        })
+    })?;
+    rows.collect::<rusqlite::Result<Vec<_>>>().map_err(Into::into)
+}
+
+pub fn delete_custom_publisher(conn: &Connection, id: &str) -> Result<()> {
+    conn.execute("DELETE FROM custom_publishers WHERE id = ?1", params![id])?;
+    // Remove articles from this publisher so they don't show stale data
+    conn.execute("DELETE FROM articles WHERE publisher_id = ?1", params![id])?;
+    Ok(())
+}
+
+// ── CRUD Operations ──────────────────────────────────────────────────────────
+
+/// Insert an article if it doesn't already exist. Returns true if inserted.
+pub fn insert_article(conn: &Connection, a: &RawArticle) -> Result<bool> {
+    let changed = conn.execute(
+        "INSERT OR IGNORE INTO articles (id, publisher_id, original_url, headline, snippet, body_text, image_url, language, published_at, category)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+        params![
+            a.id,
+            a.publisher_id,
+            a.original_url,
+            a.original_headline,
+            a.body_snippet,
+            a.body_text,
+            a.image_url,
+            a.language,
+            a.published_at,
+            a.category,
+        ],
+    )?;
+    Ok(changed > 0)
+}
+
+/// Set the translated headline for an article.
+pub fn set_translated_headline(conn: &Connection, article_id: &str, translated: &str) -> Result<()> {
+    conn.execute(
+        "UPDATE articles SET translated_headline = ?1 WHERE id = ?2",
+        params![translated, article_id],
+    )?;
+    Ok(())
+}
+
+/// Assign an article to a cluster.
+pub fn set_cluster(conn: &Connection, article_id: &str, cluster_id: &str) -> Result<()> {
+    conn.execute(
+        "UPDATE articles SET cluster_id = ?1 WHERE id = ?2",
+        params![cluster_id, article_id],
+    )?;
+    Ok(())
+}
+
+/// Create or update a cluster.
+pub fn upsert_cluster(
+    conn: &Connection,
+    id: &str,
+    headline: &str,
+    first_reported: &str,
+    last_updated: &str,
+    is_blindspot: bool,
+) -> Result<()> {
+    conn.execute(
+        "INSERT INTO clusters (id, headline, first_reported, last_updated, is_blindspot)
+         VALUES (?1, ?2, ?3, ?4, ?5)
+         ON CONFLICT(id) DO UPDATE SET
+           headline     = excluded.headline,
+           last_updated = MAX(excluded.last_updated, clusters.last_updated),
+           is_blindspot = excluded.is_blindspot",
+        params![id, headline, first_reported, last_updated, is_blindspot as i32],
+    )?;
+    Ok(())
+}
+
+// ── Queries ──────────────────────────────────────────────────────────────────
+
+/// Lightweight row for frontend display — no embeddings, no body_text.
+pub struct ArticleRowLight {
+    pub id: String,
+    pub publisher_id: String,
+    pub original_url: String,
+    pub headline: String,
+    pub translated_headline: String,
+    pub snippet: String,
+    pub image_url: String,
+    pub language: String,
+    pub published_at: String,
+    pub cluster_id: String,
+    pub category: String,
+}
+
+/// Cluster row returned to the frontend — includes ai-generated fields.
+pub struct ClusterRowLight {
+    pub id: String,
+    pub headline: String,
+    pub first_reported: String,
+    pub last_updated: String,
+    pub is_blindspot: bool,
+    pub ai_headline: String,
+    pub ai_summary: String,
+    pub articles: Vec<ArticleRowLight>,
+}
+
+/// Load clusters for frontend display using a single JOIN query (no N+1).
+pub fn load_clusters_light(
+    conn: &Connection,
+    blindspots_only: bool,
+) -> Result<Vec<ClusterRowLight>> {
+    let where_clause = if blindspots_only { "WHERE c.is_blindspot = 1" } else { "" };
+    let sql = format!(
+        "SELECT c.id, c.headline, c.first_reported, c.last_updated, c.is_blindspot,
+                c.ai_headline, c.ai_summary,
+                a.id, a.publisher_id, a.original_url, a.headline, a.translated_headline,
+                a.snippet, a.image_url, a.language, a.published_at, a.cluster_id, a.category
+         FROM clusters c
+         INNER JOIN articles a ON a.cluster_id = c.id
+         {}
+         ORDER BY c.last_updated DESC, a.published_at ASC",
+        where_clause
+    );
+
+    let mut stmt = conn.prepare(&sql)?;
+
+    let mut cluster_order: Vec<String> = Vec::new();
+    let mut cluster_map: std::collections::HashMap<
+        String,
+        (String, String, String, bool, String, String, Vec<ArticleRowLight>),
+        //  headline  first   last    blind  ai_hl   ai_sum
+    > = std::collections::HashMap::new();
+
+    let rows = stmt.query_map([], |row| {
+        let cluster_id: String    = row.get(0)?;
+        let cluster_headline      = row.get::<_, String>(1)?;
+        let first_reported        = row.get::<_, String>(2)?;
+        let last_updated          = row.get::<_, String>(3)?;
+        let is_blindspot: bool    = row.get::<_, i32>(4)? != 0;
+        let ai_headline           = row.get::<_, String>(5).unwrap_or_default();
+        let ai_summary            = row.get::<_, String>(6).unwrap_or_default();
+        let article = ArticleRowLight {
+            id:                  row.get(7)?,
+            publisher_id:        row.get(8)?,
+            original_url:        row.get(9)?,
+            headline:            row.get(10)?,
+            translated_headline: row.get::<_, String>(11).unwrap_or_default(),
+            snippet:             row.get::<_, String>(12).unwrap_or_default(),
+            image_url:           row.get(13)?,
+            language:            row.get(14)?,
+            published_at:        row.get(15)?,
+            cluster_id:          row.get(16)?,
+            category:            row.get::<_, String>(17).unwrap_or_else(|_| "general".to_string()),
+        };
+        Ok((cluster_id, cluster_headline, first_reported, last_updated,
+            is_blindspot, ai_headline, ai_summary, article))
+    })?;
+
+    for row in rows {
+        let (cid, headline, first, last, blindspot, ai_hl, ai_sum, article) = row?;
+        if !cluster_map.contains_key(&cid) {
+            cluster_order.push(cid.clone());
+            cluster_map.insert(cid.clone(), (headline, first, last, blindspot, ai_hl, ai_sum, Vec::new()));
+        }
+        if let Some(entry) = cluster_map.get_mut(&cid) {
+            entry.6.push(article);
+        }
+    }
+
+    let result = cluster_order
+        .into_iter()
+        .filter_map(|cid| {
+            cluster_map.remove(&cid).map(|(headline, first, last, blindspot, ai_headline, ai_summary, articles)| {
+                ClusterRowLight { id: cid, headline, first_reported: first, last_updated: last,
+                    is_blindspot: blindspot, ai_headline, ai_summary, articles }
+            })
+        })
+        .collect();
+
+    Ok(result)
+}
+
+/// Load cluster metadata with publisher lists for blindspot analysis — single query using GROUP_CONCAT.
+pub fn load_cluster_publishers(
+    conn: &Connection,
+) -> Result<Vec<(String, String, String, String, Vec<String>)>> {
+    let mut stmt = conn.prepare(
+        "SELECT c.id, c.headline, c.first_reported,
+                MAX(a.published_at) as last_updated,
+                GROUP_CONCAT(DISTINCT a.publisher_id) as pub_ids
+         FROM clusters c
+         JOIN articles a ON a.cluster_id = c.id
+         GROUP BY c.id",
+    )?;
+
+    let rows = stmt.query_map([], |row| {
+        let cid: String = row.get(0)?;
+        let headline: String = row.get(1)?;
+        let first: String = row.get(2)?;
+        let last: String = row.get(3)?;
+        let pub_concat: String = row.get::<_, String>(4).unwrap_or_default();
+        Ok((cid, headline, first, last, pub_concat))
+    })?;
+
+    let result = rows
+        .filter_map(|r| r.ok())
+        .map(|(cid, headline, first, last, pub_concat)| {
+            let pub_ids: Vec<String> = if pub_concat.is_empty() {
+                Vec::new()
+            } else {
+                pub_concat.split(',').map(|s| s.to_string()).collect()
+            };
+            (cid, headline, first, last, pub_ids)
+        })
+        .filter(|(_, _, _, _, pub_ids)| !pub_ids.is_empty())
+        .collect();
+
+    Ok(result)
+}
+
+/// Delete articles older than `hours` hours and orphaned clusters.
+pub fn prune_old_articles(conn: &Connection, hours: u32) -> Result<(usize, usize)> {
+    let articles_deleted = conn.execute(
+        "DELETE FROM articles WHERE published_at < datetime('now', printf('-%d hours', ?1))",
+        params![hours],
+    )?;
+    let clusters_deleted = conn.execute(
+        "DELETE FROM clusters WHERE id NOT IN (
+             SELECT DISTINCT cluster_id FROM articles WHERE cluster_id IS NOT NULL
+         )",
+        [],
+    )?;
+    Ok((articles_deleted, clusters_deleted))
+}
+
+/// Get (headline, translated_headline, language, publisher_id) for all articles in a cluster.
+pub fn get_cluster_headlines(
+    conn: &Connection,
+    cluster_id: &str,
+) -> Result<Vec<(String, String, String, String)>> {
+    let mut stmt = conn.prepare(
+        "SELECT headline, translated_headline, language, publisher_id
+         FROM articles WHERE cluster_id = ?1"
+    )?;
+    let rows = stmt
+        .query_map(params![cluster_id], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1).unwrap_or_default(),
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+            ))
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(rows)
+}
