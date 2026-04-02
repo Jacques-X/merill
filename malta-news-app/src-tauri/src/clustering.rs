@@ -36,16 +36,59 @@ struct Token {
     weight: u32,
 }
 
+/// Normalise a headline before tokenisation:
+/// • remove thousands separators:  "4,000" → "4000", "€2,500" → "€2500"
+/// • expand k / m suffixes:        "4k" → "4000", "€22m" → "€22000000"
+fn normalize_headline(text: &str) -> String {
+    let mut out = String::with_capacity(text.len() + 8);
+    let chars: Vec<char> = text.chars().collect();
+    let n = chars.len();
+    let mut i = 0;
+    while i < n {
+        let c = chars[i];
+        if c.is_ascii_digit() {
+            // Consume run of digits, dropping embedded commas (thousands separators)
+            while i < n && (chars[i].is_ascii_digit() || chars[i] == ',') {
+                if chars[i] != ',' {
+                    out.push(chars[i]);
+                }
+                i += 1;
+            }
+            // Expand k / m suffix when not followed by another alphanumeric char
+            if i < n {
+                let suffix = chars[i];
+                let not_followed = i + 1 >= n || !chars[i + 1].is_alphanumeric();
+                if not_followed {
+                    if suffix == 'k' || suffix == 'K' {
+                        out.push_str("000");
+                        i += 1;
+                        continue;
+                    } else if suffix == 'm' || suffix == 'M' {
+                        out.push_str("000000");
+                        i += 1;
+                        continue;
+                    }
+                }
+            }
+        } else {
+            out.push(c);
+            i += 1;
+        }
+    }
+    out
+}
+
 /// Extract weighted tokens from a headline.
 /// `original` is the mixed-case original text (needed to detect proper nouns).
 fn tokenize_weighted(original: &str) -> Vec<Token> {
+    let normalized = normalize_headline(original);
     let stops: HashSet<&str> = STOP_WORDS.iter().copied().collect();
-    let lower = original.to_lowercase();
+    let lower = normalized.to_lowercase();
 
-    original
+    normalized
         .split(|c: char| !c.is_alphanumeric())
         .zip(lower.split(|c: char| !c.is_alphanumeric()))
-        .filter(|(_, lw)| lw.len() > 2 && !stops.contains(lw))
+        .filter(|(_, lw)| lw.len() > 2 && !stops.contains(*lw))
         .map(|(orig_w, lw)| {
             let weight = if lw.chars().all(|c| c.is_ascii_digit()) || lw.starts_with('€') || lw.starts_with('$') {
                 3 // number / currency
@@ -83,9 +126,14 @@ fn weighted_jaccard(a: &[Token], b: &[Token]) -> (f32, u32) {
     (score, max_shared_weight)
 }
 
-/// Match threshold. With weighting this is lower than a plain Jaccard threshold
-/// because high-value shared words (names, numbers) move the score a lot.
-const JACCARD_THRESHOLD: f32 = 0.12;
+/// Primary match threshold.
+/// A single shared proper noun (weight 2) on short headlines gives ~0.125, which we
+/// intentionally reject — two Momentum stories about *different* topics must not cluster.
+const JACCARD_THRESHOLD: f32 = 0.15;
+
+/// Secondary threshold: only fires when a NUMBER token (weight 3) is shared,
+/// ensuring currency/figure-driven stories still group even at lower Jaccard scores.
+const NUMBER_BOOST_THRESHOLD: f32 = 0.08;
 
 /// Assign an article to the best matching cluster based on headline keyword overlap.
 /// Compares against every headline variant stored in the cluster, takes the best score.
@@ -105,7 +153,7 @@ pub fn assign_cluster(
             let (score, max_shared_weight) = weighted_jaccard(&article_tokens, &cluster_tokens);
 
             let passes = score >= JACCARD_THRESHOLD
-                || (max_shared_weight >= 2 && score >= 0.08);
+                || (max_shared_weight >= 3 && score >= NUMBER_BOOST_THRESHOLD);
 
             if passes && score > best_score {
                 best_score = score;

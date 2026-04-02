@@ -1,6 +1,6 @@
 name: app
 options:
-  bundleIdPrefix: mt.habbar.app
+  bundleIdPrefix: mt.merill.app
   deploymentTarget:
     iOS: 16.0
 
@@ -15,8 +15,8 @@ configs:
 settingGroups:
   app:
     base:
-      PRODUCT_NAME: Habbar
-      PRODUCT_BUNDLE_IDENTIFIER: mt.habbar.app
+      PRODUCT_NAME: Merill
+      PRODUCT_BUNDLE_IDENTIFIER: mt.merill.app
 targetTemplates:
   app:
     type: application

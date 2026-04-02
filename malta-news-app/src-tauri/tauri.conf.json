@@ -1,8 +1,8 @@
 {
   "$schema": "../node_modules/@tauri-apps/cli/config.schema.json",
-  "productName": "Habbar",
+  "productName": "Merill",
   "version": "0.1.0",
-  "identifier": "mt.habbar.app",
+  "identifier": "mt.merill.app",
   "build": {
     "frontendDist": "../dist",
     "devUrl": "http://localhost:5173",
@@ -12,7 +12,7 @@
   "app": {
     "windows": [
       {
-        "title": "Habbar",
+        "title": "Merill",
         "width": 430,
         "height": 932,
         "resizable": true,

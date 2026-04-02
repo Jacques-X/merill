@@ -84,8 +84,10 @@ fn process(
         // Always use English headline for clustering consistency
         let headline = if article.language == "en" {
             &article.original_headline
-        } else {
+        } else if !article.translated_headline.is_empty() {
             &article.translated_headline // MT->EN translation
+        } else {
+            &article.original_headline // MT original as last resort
         };
 
         let new_cluster_id = uuid::Uuid::new_v4().to_string();
@@ -191,14 +193,18 @@ pub async fn run(db: &Mutex<Connection>) -> Result<PipelineResult> {
     translate::translate_headlines(&mut raw_articles).await;
 
     for a in &mut raw_articles {
-        if a.translated_headline.is_empty() {
+        // Only fall back to original for EN articles — MT articles with no translation
+        // keep translated_headline empty so the UI can show the Maltese original correctly.
+        if a.translated_headline.is_empty() && a.language == "en" {
             a.translated_headline = a.original_headline.clone();
         }
         // Classify using URL + English headline
         let en_headline = if a.language == "en" {
             &a.original_headline
-        } else {
+        } else if !a.translated_headline.is_empty() {
             &a.translated_headline // MT->EN translation
+        } else {
+            &a.original_headline // MT original as fallback for classification
         };
         a.category = category::classify(&a.original_url, en_headline).to_string();
     }

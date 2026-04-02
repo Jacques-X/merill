@@ -1,5 +1,5 @@
 [package]
-name = "habbar"
+name = "merill"
 version = "0.1.0"
 description = "Malta news aggregator with on-device bias analysis"
 authors = ["you"]

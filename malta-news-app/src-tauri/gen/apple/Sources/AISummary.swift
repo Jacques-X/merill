@@ -15,8 +15,8 @@ private let kMaxOutput: Int = 80
 // Input  JSON: {"headlines":["…"],"snippets":["…"]}
 // Output JSON: {"headline":"…","summary":"…"}
 
-@_cdecl("habbar_generate_summary")
-public func habbarGenerateSummary(
+@_cdecl("merill_generate_summary")
+public func merillGenerateSummary(
     inputJson: UnsafePointer<Int8>,
     outputBuf: UnsafeMutablePointer<Int8>,
     bufLen: Int32

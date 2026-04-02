@@ -18,7 +18,7 @@ mod ios_ai {
         /// outputBuf  – caller-allocated buffer; receives UTF-8 JSON: {"headline":"...","summary":"..."}
         /// bufLen     – size of outputBuf in bytes
         /// Returns true on success.
-        fn habbar_generate_summary(
+        fn merill_generate_summary(
             input_json: *const c_char,
             output_buf: *mut c_char,
             buf_len:    i32,
@@ -31,7 +31,7 @@ mod ios_ai {
         let mut buf = vec![0i8; 8192];
 
         let ok = unsafe {
-            habbar_generate_summary(c_input.as_ptr(), buf.as_mut_ptr(), buf.len() as i32)
+            merill_generate_summary(c_input.as_ptr(), buf.as_mut_ptr(), buf.len() as i32)
         };
         if !ok { return None; }
 
@@ -609,7 +609,7 @@ pub fn run() {
                 .app_data_dir()
                 .expect("failed to resolve app data dir");
             std::fs::create_dir_all(&data_dir).ok();
-            let db_path = data_dir.join("habbar.db");
+            let db_path = data_dir.join("merill.db");
             log::info!("database at {}", db_path.display());
             let conn = db::open(&db_path).expect("failed to open database");
 

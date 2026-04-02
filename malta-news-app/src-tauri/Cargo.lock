@@ -1664,31 +1664,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "habbar"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "chrono",
- "feed-rs",
- "futures",
- "hex",
- "html-escape",
- "log",
- "reqwest 0.12.28",
- "rusqlite",
- "scraper",
- "serde",
- "serde_json",
- "sha2",
- "tauri",
- "tauri-build",
- "tauri-plugin-log",
- "tauri-plugin-opener",
- "tokio",
- "uuid",
-]
-
-[[package]]
 name = "hashbrown"
 version = "0.12.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2400,6 +2375,31 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "488016bfae457b036d996092f6cb448677611ce4449e970ceaf42695203f218a"
 dependencies = [
  "autocfg",
+]
+
+[[package]]
+name = "merill"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "feed-rs",
+ "futures",
+ "hex",
+ "html-escape",
+ "log",
+ "reqwest 0.12.28",
+ "rusqlite",
+ "scraper",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tauri",
+ "tauri-build",
+ "tauri-plugin-log",
+ "tauri-plugin-opener",
+ "tokio",
+ "uuid",
 ]
 
 [[package]]
