@@ -61,12 +61,17 @@ fn process(
 
     let conn = db.lock().unwrap();
 
-    // 2. Build headline map from existing clusters.
-    let mut cluster_headlines: HashMap<String, String> = HashMap::new();
+    // 2. Build headline map from existing clusters — all article headlines per cluster.
+    let mut cluster_headlines: HashMap<String, Vec<String>> = HashMap::new();
     {
         let existing = db::load_cluster_publishers(&conn)?;
-        for (cid, headline, _, _, _) in existing {
-            cluster_headlines.insert(cid, headline);
+        for (cid, _, _, _, _) in &existing {
+            if let Ok(articles) = db::get_cluster_headlines(&conn, cid) {
+                let headlines: Vec<String> = articles.into_iter().map(|(h, t, lang, _)| {
+                    if lang == "en" { h } else if !t.is_empty() { t } else { h }
+                }).collect();
+                cluster_headlines.insert(cid.clone(), headlines);
+            }
         }
     }
 
@@ -97,7 +102,7 @@ fn process(
             clusters_created += 1;
             log::info!("New cluster: {:?}", headline);
 
-            cluster_headlines.insert(assignment.cluster_id.clone(), headline.to_string());
+            cluster_headlines.insert(assignment.cluster_id.clone(), vec![headline.to_string()]);
 
             db::upsert_cluster(
                 &conn,
@@ -109,6 +114,12 @@ fn process(
             )?;
         } else {
             log::info!("Joined cluster: {} -> {}", headline, &assignment.cluster_id);
+
+            // Keep the in-memory vec up to date so subsequent articles in this batch
+            // can also match against this new headline variant.
+            if let Some(v) = cluster_headlines.get_mut(&assignment.cluster_id) {
+                v.push(headline.to_string());
+            }
 
             db::upsert_cluster(
                 &conn,

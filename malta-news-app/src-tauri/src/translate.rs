@@ -107,32 +107,23 @@ pub async fn translate_headlines(articles: &mut [RawArticle]) {
         .map(|(i, a)| (i, a.original_headline.clone()))
         .collect();
 
-    let en_tasks: Vec<(usize, String)> = articles
-        .iter()
-        .enumerate()
-        .filter(|(_, a)| a.language == "en" && a.translated_headline.is_empty())
-        .map(|(i, a)| (i, a.original_headline.clone()))
-        .collect();
-
-    let total = mt_tasks.len() + en_tasks.len();
-    if total == 0 {
+    // Only translate MT→EN: needed for clustering and consistent display.
+    // EN→MT is skipped — the UI falls back to the original English headline.
+    if mt_tasks.is_empty() {
         return;
     }
-    log::info!("translating {} mt->en + {} en->mt headlines concurrently", mt_tasks.len(), en_tasks.len());
+    log::info!("translating {} mt->en headlines", mt_tasks.len());
 
-    // Run both directions concurrently
-    let (mt_results, en_results) = futures::future::join(
-        translate_tasks(&client, mt_tasks, "mt", "en"),
-        translate_tasks(&client, en_tasks, "en", "mt"),
-    ).await;
+    let mt_results = translate_tasks(&client, mt_tasks, "mt", "en").await;
 
-    let translated_count = mt_results.iter().chain(en_results.iter())
+    let translated_count = mt_results.iter()
         .filter(|(i, t)| t != &articles[*i].original_headline)
         .count();
+    let total = mt_results.len();
 
-    for (idx, t) in mt_results.into_iter().chain(en_results) {
+    for (idx, t) in mt_results {
         articles[idx].translated_headline = t;
     }
 
-    log::info!("translation complete: {}/{} headlines translated", translated_count, total);
+    log::info!("translation complete: {}/{} mt->en headlines translated", translated_count, total);
 }

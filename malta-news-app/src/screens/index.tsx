@@ -517,6 +517,18 @@ export function FeedScreen({
         </div>
       )}
 
+      {/* Debug refresh button — desktop only */}
+      {typeof window !== "undefined" && !("ontouchstart" in window) && (
+        <button
+          onClick={handleRefresh}
+          disabled={isRefreshing}
+          style={{ margin: "8px 16px 0", padding: "6px 14px", borderRadius: 8, fontSize: 12,
+            background: "var(--color-accent)", color: "#fff", border: "none", opacity: isRefreshing ? 0.5 : 1 }}
+        >
+          {isRefreshing ? t(lang, "refreshing") : t(lang, "refresh")}
+        </button>
+      )}
+
       {/* Category filter pills */}
       {(
         <div className="category-pills">
@@ -730,7 +742,7 @@ export function SettingsScreen() {
         ))}
       </div>
 
-      {/* Malta Sources */}
+      {/* Local Sources */}
       <SourcesSection
         label={t(language, "sourcesLocal")}
         publishers={localPublishers}
@@ -738,26 +750,31 @@ export function SettingsScreen() {
         onToggle={toggleLocalPublisher}
       />
 
-      {/* International / Global Sources */}
-      <p className="settings-label" style={{ marginTop: 28 }}>{t(language, "sourcesGlobal")}</p>
-      {globalPublishers.length > 0 && (
-        <div className="settings-group">
-          {globalPublishers.map((p, i) => (
-            <SourceRow
-              key={p.id}
-              publisher={p}
-              action="delete"
-              onAction={() => handleDeleteCustom(p.id)}
-              isLast={i === globalPublishers.length - 1}
-            />
-          ))}
-        </div>
-      )}
-      <AddSourceForm isGlobal={true} onAdded={invalidatePublishers} />
-
-      {/* Custom Malta Sources (user-added local) */}
+      {/* Add Malta Source */}
       <p className="settings-label" style={{ marginTop: 28 }}>{t(language, "addMaltaSource")}</p>
       <AddSourceForm isGlobal={false} onAdded={invalidatePublishers} />
+
+      {/* Global Sources */}
+      {globalPublishers.length > 0 && (
+        <>
+          <p className="settings-label" style={{ marginTop: 28 }}>{t(language, "sourcesGlobal")}</p>
+          <div className="settings-group">
+            {globalPublishers.map((p, i) => (
+              <SourceRow
+                key={p.id}
+                publisher={p}
+                action="delete"
+                onAction={() => handleDeleteCustom(p.id)}
+                isLast={i === globalPublishers.length - 1}
+              />
+            ))}
+          </div>
+        </>
+      )}
+
+      {/* Add International Source */}
+      <p className="settings-label" style={{ marginTop: 28 }}>{t(language, "addInternationalSource")}</p>
+      <AddSourceForm isGlobal={true} onAdded={invalidatePublishers} />
 
       {/* About */}
       <div className="settings-about">

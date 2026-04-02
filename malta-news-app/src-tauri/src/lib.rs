@@ -84,6 +84,23 @@ async fn get_clusters(
     let conn = state.db.lock().unwrap();
     let raw = db::load_clusters_light(&conn, blindspots_only).map_err(|e| e.to_string())?;
 
+    // Build a fast lookup for custom publishers so their is_global flag is correct.
+    let custom_pub_map: std::collections::HashMap<String, models::PublisherInfo> =
+        db::get_custom_publishers(&conn)
+            .unwrap_or_default()
+            .into_iter()
+            .map(|p| {
+                let info = models::PublisherInfo {
+                    id: p.id.clone(),
+                    name: p.name,
+                    bias_category: models::BiasCategory::CommercialIndependent,
+                    logo_url: String::new(),
+                    is_global: p.is_global,
+                };
+                (p.id, info)
+            })
+            .collect();
+
     let clusters: Vec<StoryCluster> = raw
         .into_iter()
         .map(|c| {
@@ -95,10 +112,14 @@ async fn get_clusters(
                     } else {
                         a.translated_headline
                     };
+                    let pub_info = custom_pub_map
+                        .get(&a.publisher_id)
+                        .cloned()
+                        .unwrap_or_else(|| publisher_info(&a.publisher_id));
                     Article {
                         id: a.id,
                         publisher_id: a.publisher_id.clone(),
-                        publisher: publisher_info(&a.publisher_id),
+                        publisher: pub_info,
                         original_url: a.original_url,
                         original_headline: a.headline,
                         translated_headline: translated,
@@ -181,7 +202,8 @@ async fn fetch_article_body(
             )
             .ok();
         if let Some((body, image)) = existing {
-            if !body.is_empty() {
+            // Only return early if we have both body text AND an image
+            if !body.is_empty() && !image.is_empty() {
                 return Ok(models::ArticleBody {
                     body_text: body,
                     image_url: image,
@@ -338,48 +360,84 @@ async fn add_custom_publisher(
         .to_lowercase();
     let bytes = resp.bytes().await.map_err(|e| e.to_string())?;
 
-    // 1. Try parsing the URL directly as RSS/Atom.
-    let (feed_url, feed) = if let Ok(f) = feed_rs::parser::parse(&bytes[..]) {
-        (final_url.clone(), f)
+    // ── Method 1: direct RSS/Atom ──────────────────────────────────────────
+    enum Found { Rss { scrape_url: String, title: Option<String> }, Sitemap(String), Html { scrape_url: String, selector: String } }
+
+    let found: Found = if let Ok(feed) = feed_rs::parser::parse(&bytes[..]) {
+        Found::Rss { scrape_url: final_url.clone(), title: feed.title.map(|t| t.content) }
     } else if content_type.contains("html") || content_type.is_empty() {
-        // 2. Scan for <link rel="alternate" type="application/rss+xml|atom+xml">
         let html = String::from_utf8_lossy(&bytes);
-        let discovered = discover_feed_url(&html, &final_url)
-            // 3. Fallback: probe well-known feed paths in parallel
+
+        // ── Method 2: RSS via <link> discovery or common path probe ──────
+        let rss_url = discover_feed_url(&html, &final_url)
             .or(probe_common_feed_paths(&client, &final_url).await);
-        match discovered {
-            Some(feed_url) => {
-                let resp2 = client.get(&feed_url).send().await
-                    .map_err(|e| format!("Found feed link but could not fetch it: {}", e))?;
-                let bytes2 = resp2.bytes().await.map_err(|e| e.to_string())?;
-                let f = feed_rs::parser::parse(&bytes2[..])
-                    .map_err(|_| "Found a feed link but could not parse it".to_string())?;
-                (feed_url, f)
+
+        if let Some(feed_url) = rss_url {
+            let resp2 = client.get(&feed_url).send().await
+                .map_err(|e| format!("Found feed link but could not fetch it: {}", e))?;
+            let bytes2 = resp2.bytes().await.map_err(|e| e.to_string())?;
+            let feed = feed_rs::parser::parse(&bytes2[..])
+                .map_err(|_| "Found a feed link but could not parse it".to_string())?;
+            Found::Rss { scrape_url: feed_url, title: feed.title.map(|t| t.content) }
+        } else {
+            // ── Method 3: Google News sitemap ────────────────────────────
+            match probe_sitemap_paths(&client, &final_url).await {
+                Some(sitemap_url) => Found::Sitemap(sitemap_url),
+                None => {
+                    // ── Method 4: HTML auto-detect ───────────────────────
+                    match scraper::auto_detect_article_sel(&html) {
+                        Some(selector) => Found::Html { scrape_url: final_url.clone(), selector },
+                        None => return Err(
+                            "Could not find a feed, sitemap, or recognisable article structure at this URL.".to_string()
+                        ),
+                    }
+                }
             }
-            None => return Err(
-                "No RSS/Atom feed found. Try pasting the direct feed URL (e.g. bbc.co.uk/news/rss.xml).".to_string()
-            ),
         }
     } else {
-        return Err("URL does not appear to be a valid RSS/Atom feed".to_string());
+        return Err("URL does not appear to be a feed or a news website.".to_string());
+    };
+
+    // ── Extract name and build the DB record ──────────────────────────────
+    let page_title = || {
+        // Best-effort title from the HTML we already have
+        let html = String::from_utf8_lossy(&bytes);
+        let lower = html.to_lowercase();
+        lower.find("<title>").and_then(|s| {
+            let start = s + 7;
+            lower[start..].find("</title>").map(|e| html[start..start + e].trim().to_string())
+        })
+    };
+
+    let (scrape_url, scrape_method, scrape_config, auto_name) = match found {
+        Found::Rss { scrape_url, title } => (scrape_url, "rss".to_string(), String::new(), title),
+        Found::Sitemap(sitemap_url) => (sitemap_url, "sitemap".to_string(), String::new(), page_title()),
+        Found::Html { scrape_url, selector } => (scrape_url.clone(), "html".to_string(), selector, page_title()),
     };
 
     let resolved_name = if name.trim().is_empty() {
-        feed.title.map(|t| t.content).unwrap_or_else(|| {
-            url.trim_end_matches('/').split('/').nth(2).unwrap_or("Unknown").to_string()
+        auto_name.unwrap_or_else(|| {
+            final_url.trim_end_matches('/').split('/').nth(2).unwrap_or("Unknown").to_string()
         })
     } else {
         name.trim().to_string()
     };
 
+    log::info!("adding custom publisher '{}' via {} ({})", resolved_name, scrape_method, scrape_url);
+
     let id = format!("custom_{}", uuid::Uuid::new_v4().simple());
     let def = models::CustomPublisherDef {
         id: id.clone(),
         name: resolved_name.clone(),
-        rss_url: feed_url,
+        rss_url: scrape_url,
+        scrape_method,
+        scrape_config,
         is_global,
     };
     db::insert_custom_publisher(&state.db.lock().unwrap(), &def).map_err(|e| e.to_string())?;
+
+    // Reset scrape cooldown so the next refresh actually fetches the new publisher
+    *state.last_scraped.lock().unwrap() = None;
 
     Ok(models::PublisherInfo {
         id,
@@ -460,6 +518,39 @@ async fn probe_common_feed_paths(client: &reqwest::Client, base_url: &str) -> Op
     let results = futures::future::join_all(futs).await;
     // Return in path-order so we prefer /feed over /rss.xml etc.
     results.into_iter().find_map(|r| r)
+}
+
+/// Probe common Google News sitemap paths. Returns the first URL that has <news:title> entries.
+async fn probe_sitemap_paths(client: &reqwest::Client, base_url: &str) -> Option<String> {
+    let origin = base_url.splitn(4, '/').take(3).collect::<Vec<_>>().join("/");
+    let origin = origin.trim_end_matches('/');
+    let paths = [
+        "/sitemap_news.xml",
+        "/news-sitemap.xml",
+        "/sitemap.xml",
+        "/sitemap_latest.xml",
+        "/sitemap_index.xml",
+    ];
+
+    let futs: Vec<_> = paths.iter().map(|path| {
+        let probe = format!("{}{}", origin, path);
+        let client = client.clone();
+        async move {
+            if let Ok(resp) = client.get(&probe).send().await {
+                if resp.status().is_success() {
+                    if let Ok(body) = resp.text().await {
+                        // Must have at least one <news:title> to count as a news sitemap
+                        if body.contains("<news:title") {
+                            return Some(probe);
+                        }
+                    }
+                }
+            }
+            None
+        }
+    }).collect();
+
+    futures::future::join_all(futs).await.into_iter().find_map(|r| r)
 }
 
 fn extract_attr(tag: &str, attr: &str) -> Option<String> {

@@ -406,12 +406,16 @@ a { text-decoration: none; color: inherit; }
 }
 
 .detail-content {
-  padding: 20px;
+  padding: calc(var(--safe-top) + 20px) 20px calc(var(--safe-bottom) + 110px);
   display: flex;
   flex-direction: column;
   gap: 16px;
 }
-.detail-content.has-hero { margin-top: -32px; position: relative; }
+.detail-content.has-hero {
+  margin-top: -32px;
+  position: relative;
+  padding-top: 20px; /* hero handles safe-top via the image/fade */
+}
 
 .detail-publisher { display: flex; align-items: center; gap: 12px; }
 .detail-pub-name { font-size: 15px; font-weight: 600; color: var(--color-label); }
@@ -738,15 +742,6 @@ a { text-decoration: none; color: inherit; }
   padding: 0;
 }
 
-/* Overlay dock — single back button, left-anchored */
-.tab-bar-overlay {
-  justify-content: flex-start;
-  width: auto;
-  max-width: none;
-  left: calc(50% - 195px + 14px);
-  transform: none;
-}
-@media (max-width: 430px) { .tab-bar-overlay { left: 14px; } }
 
 /* Center pill — standalone glass capsule */
 .dock-tab-pill {
@@ -831,7 +826,6 @@ a { text-decoration: none; color: inherit; }
   backdrop-filter: var(--lg-blur-press);
   -webkit-backdrop-filter: var(--lg-blur-press);
 }
-.dock-icon-btn.ghost { opacity: 0.25; pointer-events: none; }
 .tab-label {
   font-size: 10px;
   font-weight: 700;

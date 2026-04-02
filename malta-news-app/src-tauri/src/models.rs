@@ -53,12 +53,19 @@ pub struct PublisherInfo {
     pub is_global: bool,
 }
 
-/// User-added custom publisher stored in the DB (always RSS).
+/// User-added custom publisher stored in the DB.
+/// `scrape_method` is one of: "rss" | "sitemap" | "html"
+/// `scrape_config` carries extra data per method:
+///   rss / sitemap → "" (URL is enough)
+///   html          → the CSS selector string (e.g. "h2 a[href]")
 #[derive(Debug, Clone)]
 pub struct CustomPublisherDef {
     pub id: String,
     pub name: String,
+    /// The URL to scrape (RSS feed URL, sitemap URL, or homepage URL for HTML).
     pub rss_url: String,
+    pub scrape_method: String,
+    pub scrape_config: String,
     pub is_global: bool,
 }
 

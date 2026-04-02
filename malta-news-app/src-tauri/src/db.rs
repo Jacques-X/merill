@@ -42,13 +42,24 @@ pub fn open(path: &std::path::Path) -> Result<Connection> {
         CREATE INDEX IF NOT EXISTS idx_articles_published ON articles(published_at);
 
         CREATE TABLE IF NOT EXISTS custom_publishers (
-            id       TEXT PRIMARY KEY,
-            name     TEXT NOT NULL,
-            rss_url  TEXT NOT NULL UNIQUE,
-            is_global INTEGER NOT NULL DEFAULT 0
+            id             TEXT PRIMARY KEY,
+            name           TEXT NOT NULL,
+            rss_url        TEXT NOT NULL UNIQUE,
+            scrape_method  TEXT NOT NULL DEFAULT 'rss',
+            scrape_config  TEXT NOT NULL DEFAULT '',
+            is_global      INTEGER NOT NULL DEFAULT 0
         );
         ",
     )?;
+
+    // Migration: add scrape_method / scrape_config columns if missing
+    if conn.prepare("SELECT scrape_method FROM custom_publishers LIMIT 0").is_err() {
+        conn.execute_batch(
+            "ALTER TABLE custom_publishers ADD COLUMN scrape_method TEXT NOT NULL DEFAULT 'rss';
+             ALTER TABLE custom_publishers ADD COLUMN scrape_config TEXT NOT NULL DEFAULT '';",
+        )?;
+        log::info!("migrated: added scrape_method, scrape_config to custom_publishers");
+    }
 
     // Migration: add translated_headline column if missing
     let has_col: bool = conn
@@ -113,22 +124,26 @@ pub fn open(path: &std::path::Path) -> Result<Connection> {
 
 pub fn insert_custom_publisher(conn: &Connection, p: &CustomPublisherDef) -> Result<()> {
     conn.execute(
-        "INSERT OR REPLACE INTO custom_publishers (id, name, rss_url, is_global) VALUES (?1, ?2, ?3, ?4)",
-        params![p.id, p.name, p.rss_url, p.is_global as i32],
+        "INSERT OR REPLACE INTO custom_publishers (id, name, rss_url, scrape_method, scrape_config, is_global)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        params![p.id, p.name, p.rss_url, p.scrape_method, p.scrape_config, p.is_global as i32],
     )?;
     Ok(())
 }
 
 pub fn get_custom_publishers(conn: &Connection) -> Result<Vec<CustomPublisherDef>> {
     let mut stmt = conn.prepare(
-        "SELECT id, name, rss_url, is_global FROM custom_publishers ORDER BY name",
+        "SELECT id, name, rss_url, scrape_method, scrape_config, is_global
+         FROM custom_publishers ORDER BY name",
     )?;
     let rows = stmt.query_map([], |row| {
         Ok(CustomPublisherDef {
             id: row.get(0)?,
             name: row.get(1)?,
             rss_url: row.get(2)?,
-            is_global: row.get::<_, i32>(3)? != 0,
+            scrape_method: row.get::<_, String>(3).unwrap_or_else(|_| "rss".to_string()),
+            scrape_config: row.get::<_, String>(4).unwrap_or_default(),
+            is_global: row.get::<_, i32>(5)? != 0,
         })
     })?;
     rows.collect::<rusqlite::Result<Vec<_>>>().map_err(Into::into)

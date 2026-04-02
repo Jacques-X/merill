@@ -36,29 +36,19 @@ function BottomDock({
   mode?: "feed" | "overlay";
 }) {
   const lang = useAppStore(s => s.language);
-  if (mode === "overlay") {
-    return (
-      <nav className="tab-bar tab-bar-overlay">
-        <button className="dock-icon-btn" onClick={onBack} aria-label="Back">
-          <svg width="11" height="18" viewBox="0 0 11 18" fill="none">
-            <path d="M10 1L2 9l8 8" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round" />
-          </svg>
-        </button>
-      </nav>
-    );
-  }
+  const overlay = mode === "overlay";
 
   return (
     <nav className="tab-bar">
-      {/* Left anchor — Back (ghost on main feed) */}
-      <button className="dock-icon-btn ghost" aria-label="Back" disabled>
-        <svg width="11" height="18" viewBox="0 0 11 18" fill="none">
+      {/* Back — always visible, always same position */}
+      <button className="dock-icon-btn" onClick={onBack} aria-label="Back">
+        <svg width="11" height="18" viewBox="0 0 12 18" fill="none">
           <path d="M10 1L2 9l8 8" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round" />
         </svg>
       </button>
 
-      {/* Center — tab pill */}
-      <div className="dock-tab-pill">
+      {/* Center pill — hidden in overlay mode */}
+      <div className="dock-tab-pill" style={overlay ? { opacity: 0, pointerEvents: "none" } : undefined}>
         <button
           className={`tab-btn${active === "local" ? " active" : ""}`}
           onClick={() => onTabChange("local")}
@@ -82,8 +72,13 @@ function BottomDock({
         </button>
       </div>
 
-      {/* Right anchor — Settings */}
-      <button className="dock-icon-btn" onClick={onSettings} aria-label="Settings">
+      {/* Settings — hidden in overlay mode */}
+      <button
+        className="dock-icon-btn"
+        onClick={onSettings}
+        aria-label="Settings"
+        style={overlay ? { opacity: 0, pointerEvents: "none" } : undefined}
+      >
         <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">
           <path d="M12.22 2h-.44a2 2 0 0 0-2 2v.18a2 2 0 0 1-1 1.73l-.43.25a2 2 0 0 1-2 0l-.15-.08a2 2 0 0 0-2.73.73l-.22.38a2 2 0 0 0 .73 2.73l.15.1a2 2 0 0 1 1 1.72v.51a2 2 0 0 1-1 1.74l-.15.09a2 2 0 0 0-.73 2.73l.22.38a2 2 0 0 0 2.73.73l.15-.08a2 2 0 0 1 2 0l.43.25a2 2 0 0 1 1 1.73V20a2 2 0 0 0 2 2h.44a2 2 0 0 0 2-2v-.18a2 2 0 0 1 1-1.73l.43-.25a2 2 0 0 1 2 0l.15.08a2 2 0 0 0 2.73-.73l.22-.39a2 2 0 0 0-.73-2.73l-.15-.08a2 2 0 0 1-1-1.74v-.5a2 2 0 0 1 1-1.74l.15-.09a2 2 0 0 0 .73-2.73l-.22-.38a2 2 0 0 0-2.73-.73l-.15.08a2 2 0 0 1-2 0l-.43-.25a2 2 0 0 1-1-1.73V4a2 2 0 0 0-2-2z" />
           <circle cx="12" cy="12" r="3" />
