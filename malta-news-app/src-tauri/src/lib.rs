@@ -28,7 +28,7 @@ mod ios_ai {
     pub fn generate(headlines: &[String], snippets: &[String]) -> Option<(String, String)> {
         let input = serde_json::json!({ "headlines": headlines, "snippets": snippets });
         let c_input = CString::new(input.to_string()).ok()?;
-        let mut buf = vec![0i8; 8192];
+        let mut buf = vec![0i8; 32768];
 
         let ok = unsafe {
             merill_generate_summary(c_input.as_ptr(), buf.as_mut_ptr(), buf.len() as i32)
@@ -94,7 +94,7 @@ async fn get_clusters(
                     id: p.id.clone(),
                     name: p.name,
                     bias_category: models::BiasCategory::CommercialIndependent,
-                    logo_url: String::new(),
+                    logo_url: favicon_from_url(&p.rss_url),
                     is_global: p.is_global,
                 };
                 (p.id, info)
@@ -319,7 +319,7 @@ fn get_publishers(state: tauri::State<'_, AppState>) -> Vec<models::PublisherInf
                 id: p.id,
                 name: p.name,
                 bias_category: models::BiasCategory::CommercialIndependent,
-                logo_url: String::new(),
+                logo_url: favicon_from_url(&p.rss_url),
                 is_global: p.is_global,
             });
         }
@@ -443,9 +443,24 @@ async fn add_custom_publisher(
         id,
         name: resolved_name,
         bias_category: models::BiasCategory::CommercialIndependent,
-        logo_url: String::new(),
+        logo_url: favicon_from_url(&final_url),
         is_global,
     })
+}
+
+/// Derive a favicon URL from any URL by keeping only the scheme + host.
+/// e.g. "https://bbc.com/news/rss.xml" → "https://bbc.com/favicon.ico"
+fn favicon_from_url(url: &str) -> String {
+    let after_scheme = url.find("://").map(|i| i + 3).unwrap_or(0);
+    let host_end = url[after_scheme..]
+        .find('/')
+        .map(|i| i + after_scheme)
+        .unwrap_or(url.len());
+    if host_end > after_scheme {
+        format!("{}/favicon.ico", &url[..host_end])
+    } else {
+        String::new()
+    }
 }
 
 /// Scan HTML for <link rel="alternate" type="application/rss+xml" href="...">
@@ -467,7 +482,6 @@ fn discover_feed_url(html: &str, base_url: &str) -> Option<String> {
                 let absolute = if href.starts_with("http://") || href.starts_with("https://") {
                     href
                 } else {
-                    let base = base_url.trim_end_matches('/');
                     let path = href.trim_start_matches('/');
                     // Get origin from base_url
                     let origin = base_url.splitn(4, '/').take(3).collect::<Vec<_>>().join("/");
@@ -515,7 +529,10 @@ async fn probe_common_feed_paths(client: &reqwest::Client, base_url: &str) -> Op
         }
     }).collect();
 
-    let results = futures::future::join_all(futs).await;
+    let results = tokio::time::timeout(
+        std::time::Duration::from_secs(20),
+        futures::future::join_all(futs),
+    ).await.unwrap_or_default();
     // Return in path-order so we prefer /feed over /rss.xml etc.
     results.into_iter().find_map(|r| r)
 }
@@ -550,7 +567,10 @@ async fn probe_sitemap_paths(client: &reqwest::Client, base_url: &str) -> Option
         }
     }).collect();
 
-    futures::future::join_all(futs).await.into_iter().find_map(|r| r)
+    tokio::time::timeout(
+        std::time::Duration::from_secs(20),
+        futures::future::join_all(futs),
+    ).await.unwrap_or_default().into_iter().find_map(|r| r)
 }
 
 fn extract_attr(tag: &str, attr: &str) -> Option<String> {
@@ -567,6 +587,31 @@ fn extract_attr(tag: &str, attr: &str) -> Option<String> {
     };
     let end = rest.find(quote)?;
     Some(rest[..end].to_string())
+}
+
+/// Move a single article to its own new cluster (user-initiated split).
+/// Returns the new cluster_id so the frontend can optimistically remove the row.
+#[tauri::command]
+async fn split_cluster(
+    state: tauri::State<'_, AppState>,
+    article_id: String,
+    headline: String,
+    published_at: String,
+) -> Result<String, String> {
+    let new_cluster_id = uuid::Uuid::new_v4().to_string();
+    let conn = state.db.lock().unwrap();
+    db::split_article_to_cluster(&conn, &article_id, &new_cluster_id, &headline, &published_at)
+        .map_err(|e| e.to_string())?;
+    Ok(new_cluster_id)
+}
+
+/// Wipe all cluster assignments and re-cluster every article in the DB from scratch.
+#[tauri::command]
+fn force_recluster(state: tauri::State<'_, AppState>) -> Result<String, String> {
+    // Reset scrape cooldown so a subsequent normal refresh also runs.
+    *state.last_scraped.lock().unwrap() = None;
+    let result = pipeline::recluster_all(&state.db).map_err(|e| e.to_string())?;
+    Ok(format!("{} clusters created", result.clusters_created))
 }
 
 #[tauri::command]
@@ -613,6 +658,12 @@ pub fn run() {
             log::info!("database at {}", db_path.display());
             let conn = db::open(&db_path).expect("failed to open database");
 
+            // Prune articles older than 7 days at every startup to keep the DB small.
+            match db::prune_old_articles(&conn, 7) {
+                Ok(n) => log::info!("pruned {} old articles", n),
+                Err(e) => log::warn!("pruning failed: {}", e),
+            }
+
             app.manage(AppState {
                 db: Mutex::new(conn),
                 last_scraped: Mutex::new(None),
@@ -621,7 +672,7 @@ pub fn run() {
             Ok(())
         })
         .plugin(tauri_plugin_opener::init())
-        .invoke_handler(tauri::generate_handler![get_clusters, get_publishers, refresh_feed, fetch_article_body, translate_summary, generate_cluster_summary, add_custom_publisher, remove_custom_publisher])
+        .invoke_handler(tauri::generate_handler![get_clusters, get_publishers, refresh_feed, fetch_article_body, translate_summary, generate_cluster_summary, add_custom_publisher, remove_custom_publisher, split_cluster, force_recluster])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
 }

@@ -8,37 +8,66 @@ pub struct ClusterAssignment {
     pub is_new: bool,
 }
 
-/// Words too generic to be useful for matching news stories.
-const STOP_WORDS: &[&str] = &[
-    "malta", "maltese", "gozo", "says", "said", "claims", "updated",
-    "breaking", "watch", "news", "report", "today", "people", "first",
-    "last", "after", "before", "been", "being", "from", "have", "that",
-    "this", "they", "their", "them", "then", "than", "these", "those",
-    "were", "what", "when", "where", "which", "while", "with", "will",
-    "would", "could", "should", "about", "also", "back", "called",
-    "come", "does", "down", "each", "even", "every", "gets", "give",
-    "goes", "going", "gone", "good", "great", "here", "high", "however",
-    "into", "just", "know", "left", "like", "long", "look", "made",
-    "make", "many", "more", "most", "much", "must", "need", "next",
-    "only", "open", "other", "over", "part", "same", "show", "some",
-    "still", "such", "take", "tell", "time", "told", "took", "turn",
-    "under", "upon", "used", "very", "want", "well", "went", "year",
-    "years", "your", "held", "hold",
-];
-
-/// Token weight: numbers and short uppercase-preserved tokens score highest.
-///   number  → 3   (e.g. "2026", "€50m", "10")
-///   proper  → 2   (capitalised in original, e.g. "Abela", "Gozo")
-///   plain   → 1
-#[derive(Clone)]
-struct Token {
-    word: String,
-    weight: u32,
+pub struct ClusterData {
+    pub headlines: Vec<String>,
+    /// Pre-tokenized forms of `headlines` — kept in sync so `assign_cluster`
+    /// never re-tokenizes the same headline twice.
+    pub tokenized_headlines: Vec<Vec<Token>>,
+    pub last_updated: String, // ISO 8601
 }
 
-/// Normalise a headline before tokenisation:
-/// • remove thousands separators:  "4,000" → "4000", "€2,500" → "€2500"
-/// • expand k / m suffixes:        "4k" → "4000", "€22m" → "€22000000"
+/// Words too generic to be useful for matching news stories.
+const STOP_WORDS: &[&str] = &[
+    // Malta geography — appears in virtually every headline, adds no discrimination
+    "malta", "maltese", "gozo", "gozitan", "valletta",
+    // Reporting verbs — present in almost every news headline
+    "says", "said", "claims", "claim", "report", "reports", "reported",
+    "confirms", "confirmed", "deny", "denies", "announces", "announced",
+    "statement", "breaking", "exclusive", "updated", "watch", "news",
+    // Temporal markers
+    "today", "yesterday", "tomorrow",
+    "monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday",
+    "week", "weeks", "month", "months", "year", "years", "day", "days",
+    "annual", "weekly", "monthly",
+    // Position / ordinal words
+    "first", "second", "third", "last", "next", "new",
+    // Generic quantifiers and modifiers
+    "more", "most", "much", "many", "some", "all", "also", "even", "just",
+    "only", "very", "still", "back", "high", "good", "great", "long",
+    "open", "same", "each", "every", "other", "such", "over", "under",
+    "upon", "part", "need", "want",
+    // Generic verbs that don't identify a story
+    "come", "does", "down", "gets", "give", "goes", "going", "gone",
+    "hold", "held", "know", "left", "like", "look", "made", "make",
+    "take", "tell", "told", "took", "turn", "used", "went", "well",
+    "call", "called", "show", "here", "people",
+    // Function words
+    "about", "after", "before", "being", "been", "from", "have", "into",
+    "that", "this", "they", "their", "them", "then", "than", "these",
+    "those", "were", "what", "when", "where", "which", "while", "with",
+    "will", "would", "could", "should",
+];
+
+/// Similarity thresholds.
+const COSINE_BASE: f32 = 0.28;
+/// Lowered threshold when a high-specificity proper noun or number is shared.
+const COSINE_ANCHOR: f32 = 0.20;
+/// Stale-cluster penalty: multiply base threshold by this when gap > STALE_HOURS.
+const COSINE_STALE_MULT: f32 = 1.5;
+const STALE_HOURS: f64 = 72.0;
+/// Minimum IDF a token needs to qualify as an "anchor" (prevents generic proper nouns like
+/// "Police" or "Government" from triggering the lower threshold).
+const ANCHOR_MIN_IDF: f32 = 2.0;
+
+#[derive(Clone)]
+pub struct Token {
+    pub word: String,
+    pub weight: u32,
+}
+
+/// Normalise numeric strings before tokenisation:
+///   thousands separators: "4,000" → "4000"
+///   k/m suffixes:         "4k" → "4000", "€22m" → "€22000000"
 fn normalize_headline(text: &str) -> String {
     let mut out = String::with_capacity(text.len() + 8);
     let chars: Vec<char> = text.chars().collect();
@@ -47,14 +76,12 @@ fn normalize_headline(text: &str) -> String {
     while i < n {
         let c = chars[i];
         if c.is_ascii_digit() {
-            // Consume run of digits, dropping embedded commas (thousands separators)
             while i < n && (chars[i].is_ascii_digit() || chars[i] == ',') {
                 if chars[i] != ',' {
                     out.push(chars[i]);
                 }
                 i += 1;
             }
-            // Expand k / m suffix when not followed by another alphanumeric char
             if i < n {
                 let suffix = chars[i];
                 let not_followed = i + 1 >= n || !chars[i + 1].is_alphanumeric();
@@ -79,83 +106,227 @@ fn normalize_headline(text: &str) -> String {
 }
 
 /// Extract weighted tokens from a headline.
-/// `original` is the mixed-case original text (needed to detect proper nouns).
-fn tokenize_weighted(original: &str) -> Vec<Token> {
+///
+/// Weights:
+///   3 — pure number / currency figure
+///   2 — proper noun (capitalised **not** at position 0, to avoid the
+///        sentence-initial capital false-positive), or an all-caps acronym (EU, PN)
+///   1 — ordinary word
+pub fn tokenize_weighted(original: &str) -> Vec<Token> {
     let normalized = normalize_headline(original);
     let stops: HashSet<&str> = STOP_WORDS.iter().copied().collect();
     let lower = normalized.to_lowercase();
 
-    normalized
-        .split(|c: char| !c.is_alphanumeric())
-        .zip(lower.split(|c: char| !c.is_alphanumeric()))
-        .filter(|(_, lw)| lw.len() > 2 && !stops.contains(*lw))
-        .map(|(orig_w, lw)| {
-            let weight = if lw.chars().all(|c| c.is_ascii_digit()) || lw.starts_with('€') || lw.starts_with('$') {
-                3 // number / currency
-            } else if orig_w.chars().next().map_or(false, |c| c.is_uppercase()) && lw.len() >= 3 {
-                2 // proper noun
-            } else {
-                1
-            };
-            Token { word: lw.to_string(), weight }
+    let orig_words: Vec<&str> = normalized.split(|c: char| !c.is_alphanumeric()).collect();
+    let lower_words: Vec<&str> = lower.split(|c: char| !c.is_alphanumeric()).collect();
+
+    let n = orig_words.len().min(lower_words.len());
+    let mut result = Vec::new();
+
+    for i in 0..n {
+        let orig_w = orig_words[i];
+        let lw = lower_words[i];
+
+        if lw.len() <= 2 || stops.contains(lw) {
+            continue;
+        }
+
+        let weight = if lw.chars().all(|c| c.is_ascii_digit()) {
+            3 // number
+        } else if orig_w.len() >= 2 && orig_w.chars().all(|c| c.is_uppercase() || !c.is_alphabetic()) {
+            // All-caps acronym (EU, PN, PL, AFP) — proper noun even at position 0
+            2
+        } else if i > 0 && orig_w.chars().next().map_or(false, |c| c.is_uppercase()) {
+            // Title-case proper noun, but only when NOT the first token
+            // (first word is always capitalised in English headlines)
+            2
+        } else {
+            1
+        };
+
+        result.push(Token { word: lw.to_string(), weight });
+    }
+
+    add_bigrams(result)
+}
+
+/// Append compound tokens for adjacent proper nouns / numbers.
+///
+/// Example: ["robert"(2), "abela"(2)] → adds "robert_abela"(3)
+/// The original tokens are kept so partial matches ("Abela" alone) still work.
+fn add_bigrams(mut tokens: Vec<Token>) -> Vec<Token> {
+    let n = tokens.len();
+    let mut bigrams = Vec::new();
+    for i in 0..n.saturating_sub(1) {
+        if tokens[i].weight >= 2 && tokens[i + 1].weight >= 2 {
+            bigrams.push(Token {
+                word: format!("{}_{}", tokens[i].word, tokens[i + 1].word),
+                weight: 3,
+            });
+        }
+    }
+    tokens.extend(bigrams);
+    tokens
+}
+
+// ── IDF table ───────────────────────────────────────────────────────────────
+
+/// Build a smoothed IDF table from all cluster headlines.
+///
+///   IDF(w) = ln((N + 1) / (df(w) + 1)) + 1
+///
+/// where N = number of clusters and df(w) = clusters that contain word w.
+pub fn build_idf_table(cluster_data: &HashMap<String, ClusterData>) -> HashMap<String, f32> {
+    let n = cluster_data.len() as f32;
+    if n == 0.0 {
+        return HashMap::new();
+    }
+
+    let mut df: HashMap<String, u32> = HashMap::new();
+
+    for data in cluster_data.values() {
+        let mut seen: HashSet<String> = HashSet::new();
+        for headline in &data.headlines {
+            for tok in tokenize_weighted(headline) {
+                seen.insert(tok.word);
+            }
+        }
+        for word in seen {
+            *df.entry(word).or_insert(0) += 1;
+        }
+    }
+
+    df.into_iter()
+        .map(|(word, count)| {
+            let idf = ((n + 1.0) / (count as f32 + 1.0)).ln() + 1.0;
+            (word, idf)
         })
         .collect()
 }
 
-/// Weighted Jaccard: sum of weights of shared tokens / sum of weights of union tokens.
-fn weighted_jaccard(a: &[Token], b: &[Token]) -> (f32, u32) {
-    let a_map: HashMap<&str, u32> = a.iter().map(|t| (t.word.as_str(), t.weight)).collect();
-    let b_map: HashMap<&str, u32> = b.iter().map(|t| (t.word.as_str(), t.weight)).collect();
+// ── TF-IDF cosine similarity ────────────────────────────────────────────────
 
-    let mut intersection_w = 0u32;
-    let mut union_w = 0u32;
-    let mut max_shared_weight = 0u32;
-
-    let all_words: HashSet<&str> = a_map.keys().chain(b_map.keys()).copied().collect();
-    for word in all_words {
-        let wa = a_map.get(word).copied().unwrap_or(0);
-        let wb = b_map.get(word).copied().unwrap_or(0);
-        intersection_w += wa.min(wb);
-        union_w += wa.max(wb);
-        if wa > 0 && wb > 0 {
-            max_shared_weight = max_shared_weight.max(wa.min(wb));
-        }
+/// Compute TF-IDF cosine similarity between two token lists.
+///
+/// Score = dot(a, b) / (|a| * |b|)
+/// where each token dimension = token_weight * IDF.
+///
+/// Also returns `has_anchor`: true when a shared token has weight ≥ 2 AND
+/// IDF ≥ ANCHOR_MIN_IDF (indicating a rare enough proper noun or number).
+fn tfidf_cosine(
+    a: &[Token],
+    b: &[Token],
+    idf: &HashMap<String, f32>,
+) -> (f32, bool) {
+    if a.is_empty() || b.is_empty() {
+        return (0.0, false);
     }
 
-    let score = if union_w == 0 { 0.0 } else { intersection_w as f32 / union_w as f32 };
-    (score, max_shared_weight)
+    let default_idf = 1.0_f32;
+
+    let a_scores: HashMap<&str, f32> = a
+        .iter()
+        .map(|t| {
+            let idf_val = idf.get(t.word.as_str()).copied().unwrap_or(default_idf);
+            (t.word.as_str(), t.weight as f32 * idf_val)
+        })
+        .collect();
+
+    let b_scores: HashMap<&str, f32> = b
+        .iter()
+        .map(|t| {
+            let idf_val = idf.get(t.word.as_str()).copied().unwrap_or(default_idf);
+            (t.word.as_str(), t.weight as f32 * idf_val)
+        })
+        .collect();
+
+    let dot: f32 = a_scores
+        .iter()
+        .filter_map(|(word, wa)| b_scores.get(word).map(|wb| wa * wb))
+        .sum();
+
+    if dot == 0.0 {
+        return (0.0, false);
+    }
+
+    // Anchor: a shared token that is a proper noun / number AND rare enough.
+    let has_anchor = a.iter().any(|ta| {
+        ta.weight >= 2
+            && ta.word.len() >= 3
+            && b_scores.contains_key(ta.word.as_str())
+            && idf.get(ta.word.as_str()).copied().unwrap_or(0.0) >= ANCHOR_MIN_IDF
+    });
+
+    let mag_a: f32 = a_scores.values().map(|v| v * v).sum::<f32>().sqrt();
+    let mag_b: f32 = b_scores.values().map(|v| v * v).sum::<f32>().sqrt();
+
+    if mag_a == 0.0 || mag_b == 0.0 {
+        return (0.0, false);
+    }
+
+    (dot / (mag_a * mag_b), has_anchor)
 }
 
-/// Primary match threshold.
-/// A single shared proper noun (weight 2) on short headlines gives ~0.125, which we
-/// intentionally reject — two Momentum stories about *different* topics must not cluster.
-const JACCARD_THRESHOLD: f32 = 0.15;
+// ── Time helper ─────────────────────────────────────────────────────────────
 
-/// Secondary threshold: only fires when a NUMBER token (weight 3) is shared,
-/// ensuring currency/figure-driven stories still group even at lower Jaccard scores.
-const NUMBER_BOOST_THRESHOLD: f32 = 0.08;
+/// Rough hours between two ISO 8601 timestamps ("YYYY-MM-DDTHH:…").
+/// Precision is ~1 hour, good enough for the 72-hour staleness check.
+fn hours_between(a: &str, b: &str) -> f64 {
+    fn to_hours(s: &str) -> Option<f64> {
+        let bytes = s.as_bytes();
+        if bytes.len() < 13 {
+            return None;
+        }
+        let year: f64  = std::str::from_utf8(&bytes[0..4]).ok()?.parse().ok()?;
+        let month: f64 = std::str::from_utf8(&bytes[5..7]).ok()?.parse().ok()?;
+        let day: f64   = std::str::from_utf8(&bytes[8..10]).ok()?.parse().ok()?;
+        let hour: f64  = std::str::from_utf8(&bytes[11..13]).ok()?.parse().ok()?;
+        // Approximate: months treated as 30.44 days, years as 365.25 days
+        Some(year * 8766.0 + month * 730.5 + day * 24.0 + hour)
+    }
+    let ha = to_hours(a).unwrap_or(0.0);
+    let hb = to_hours(b).unwrap_or(0.0);
+    (ha - hb).abs()
+}
 
-/// Assign an article to the best matching cluster based on headline keyword overlap.
-/// Compares against every headline variant stored in the cluster, takes the best score.
+// ── Cluster assignment ───────────────────────────────────────────────────────
+
+/// Assign a new article to the best matching existing cluster, or create a new one.
+///
+/// Uses TF-IDF cosine similarity with:
+///   - lower threshold when a rare proper-noun / number anchor is shared
+///   - higher threshold when article is > 72 h newer than the cluster
 pub fn assign_cluster(
     article_headline: &str,
-    cluster_headlines: &HashMap<String, Vec<String>>,
+    article_published_at: &str,
+    cluster_data: &HashMap<String, ClusterData>,
+    idf: &HashMap<String, f32>,
     new_cluster_id: &str,
 ) -> ClusterAssignment {
     let article_tokens = tokenize_weighted(article_headline);
 
+    if article_tokens.is_empty() {
+        return ClusterAssignment { cluster_id: new_cluster_id.to_string(), is_new: true };
+    }
+
     let mut best_id = "";
-    let mut best_score = 0.0f32;
+    let mut best_score = 0.0_f32;
 
-    for (cid, headlines) in cluster_headlines {
-        for headline in headlines {
-            let cluster_tokens = tokenize_weighted(headline);
-            let (score, max_shared_weight) = weighted_jaccard(&article_tokens, &cluster_tokens);
+    for (cid, data) in cluster_data {
+        let is_stale = hours_between(article_published_at, &data.last_updated) > STALE_HOURS;
 
-            let passes = score >= JACCARD_THRESHOLD
-                || (max_shared_weight >= 3 && score >= NUMBER_BOOST_THRESHOLD);
+        for cluster_tokens in &data.tokenized_headlines {
+            let (score, has_anchor) = tfidf_cosine(&article_tokens, cluster_tokens, idf);
 
-            if passes && score > best_score {
+            let threshold = if is_stale {
+                COSINE_BASE * COSINE_STALE_MULT
+            } else if has_anchor {
+                COSINE_ANCHOR
+            } else {
+                COSINE_BASE
+            };
+
+            if score >= threshold && score > best_score {
                 best_score = score;
                 best_id = cid;
             }
@@ -171,24 +342,27 @@ pub fn assign_cluster(
 
 // ── Blindspot detection ─────────────────────────────────────────────────────
 
-const INDEPENDENT: &[BiasCategory] = &[BiasCategory::CommercialIndependent, BiasCategory::InvestigativeIndependent];
+const INDEPENDENT: &[BiasCategory] = &[
+    BiasCategory::CommercialIndependent,
+    BiasCategory::InvestigativeIndependent,
+];
 
-/// A cluster is a blindspot when no independent outlet (commercial or investigative)
-/// covered the story — regardless of which non-independent outlets did cover it.
-/// This flags party-only, state-only, church-only, and any combination without independents.
 pub fn is_blindspot(publisher_ids: &[&str]) -> bool {
-    if publisher_ids.is_empty() { return false; }
-    let categories: HashSet<BiasCategory> = publisher_ids.iter()
+    if publisher_ids.is_empty() {
+        return false;
+    }
+    let categories: HashSet<BiasCategory> = publisher_ids
+        .iter()
         .filter_map(|id| PUBLISHERS.get(id).map(|p| p.bias_category))
         .collect();
-    if categories.is_empty() { return false; }
+    if categories.is_empty() {
+        return false;
+    }
     !categories.iter().any(|c| INDEPENDENT.contains(c))
 }
 
 // ── Best headline selection ─────────────────────────────────────────────────
 
-/// Score a publisher for headline neutrality.
-/// Higher = more neutral/independent.
 fn source_score(publisher_id: &str) -> u8 {
     match PUBLISHERS.get(publisher_id).map(|p| p.bias_category) {
         Some(BiasCategory::InvestigativeIndependent) => 4,
@@ -201,19 +375,14 @@ fn source_score(publisher_id: &str) -> u8 {
 }
 
 /// Pick the most representative headline for a cluster.
-/// Prefers independent sources (most neutral framing), then longest headline.
 /// Input: (original_headline, translated_headline, language, publisher_id)
-pub fn pick_best_headline(
-    articles: &[(String, String, String, String)],
-) -> String {
+pub fn pick_best_headline(articles: &[(String, String, String, String)]) -> String {
     if articles.is_empty() {
         return String::new();
     }
-
     articles
         .iter()
         .map(|(headline, translated, lang, pub_id)| {
-            // Get the English headline for the cluster display
             let en_headline = if lang == "en" {
                 headline.as_str()
             } else if !translated.is_empty() {

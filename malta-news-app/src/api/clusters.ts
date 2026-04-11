@@ -41,6 +41,14 @@ export async function removeCustomPublisher(id: string): Promise<void> {
   return invoke<void>("remove_custom_publisher", { id });
 }
 
+export async function splitCluster(articleId: string, headline: string, publishedAt: string): Promise<string> {
+  return invoke<string>("split_cluster", { articleId, headline, publishedAt });
+}
+
+export async function forceRecluster(): Promise<string> {
+  return invoke<string>("force_recluster");
+}
+
 export function useRefreshFeed() {
   return useQuery({
     queryKey: ["refresh"],

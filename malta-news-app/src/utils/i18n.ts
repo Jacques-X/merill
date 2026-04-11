@@ -102,6 +102,30 @@ const strings = {
     biasChurch: "Church",
     biasIndependent: "Independent",
     biasInvestigative: "Investigative",
+    // New-since-last-visit badge
+    newBadge: "New",
+
+    // Story timeline
+    storyTimeline: "Timeline",
+    brokeTheStory: "broke it",
+
+    // Compare framing
+    compareFraming: "Compare Framing",
+    labourSays: "PL",
+    nationalistSays: "PN",
+
+    // Reading experience
+    minRead: "min read",
+    fontSize: "Text Size",
+
+    // Publisher article count (Settings)
+    articlesToday: "articles",
+
+    // Cluster management
+    splitFromCluster: "Remove",
+    forceRecluster: "Re-cluster Feed",
+    reclustering: "Re-clustering\u2026",
+
     // Bias labels (short — used in bar legend)
     biasStateShort: "State",
     biasPlShort: "PL",
@@ -109,6 +133,12 @@ const strings = {
     biasChurchShort: "Church",
     biasIndependentShort: "Indep.",
     biasInvestigativeShort: "Invest.",
+    biasLeft: "Left",
+    biasLeftShort: "Left",
+    biasCentre: "Centre",
+    biasCentreShort: "Centre",
+    biasRight: "Right",
+    biasRightShort: "Right",
   },
   mt: {
     topStories: "L-Aħbarijiet",
@@ -198,12 +228,32 @@ const strings = {
     biasChurch: "Knisja",
     biasIndependent: "Indipendenti",
     biasInvestigative: "Investigattiv",
+    newBadge: "Ġdid",
+    storyTimeline: "Kronolġija",
+    brokeTheStory: "irrapporta l-ewwel",
+    compareFraming: "Qabbel",
+    labourSays: "PL",
+    nationalistSays: "PN",
+    minRead: "min qari",
+    fontSize: "Daqs tat-Test",
+    articlesToday: "artikli",
+
+    splitFromCluster: "Neħħi",
+    forceRecluster: "Erġa' Raggruppa",
+    reclustering: "Qed jirraggera\u2026",
+
     biasStateShort: "Stat",
     biasPlShort: "PL",
     biasPnShort: "PN",
     biasChurchShort: "Knisja",
     biasIndependentShort: "Indep.",
     biasInvestigativeShort: "Invest.",
+    biasLeft: "Xellug",
+    biasLeftShort: "Xellug",
+    biasCentre: "Ċentru",
+    biasCentreShort: "Ċentru",
+    biasRight: "Lemin",
+    biasRightShort: "Lemin",
   },
 } as const;
 

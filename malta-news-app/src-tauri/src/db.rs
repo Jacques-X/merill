@@ -120,6 +120,25 @@ pub fn open(path: &std::path::Path) -> Result<Connection> {
     Ok(conn)
 }
 
+// ── Maintenance ──────────────────────────────────────────────────────────────
+
+/// Delete articles older than `days` days and orphaned clusters with no articles.
+pub fn prune_old_articles(conn: &Connection, days: u32) -> Result<usize> {
+    let cutoff = format!("-{} days", days);
+    let deleted = conn.execute(
+        "DELETE FROM articles WHERE published_at < datetime('now', ?1)",
+        rusqlite::params![cutoff],
+    )?;
+    // Remove clusters that now have no articles.
+    conn.execute(
+        "DELETE FROM clusters WHERE id NOT IN (
+             SELECT DISTINCT cluster_id FROM articles WHERE cluster_id IS NOT NULL
+         )",
+        [],
+    )?;
+    Ok(deleted)
+}
+
 // ── Custom Publishers ────────────────────────────────────────────────────────
 
 pub fn insert_custom_publisher(conn: &Connection, p: &CustomPublisherDef) -> Result<()> {
@@ -376,19 +395,66 @@ pub fn load_cluster_publishers(
     Ok(result)
 }
 
-/// Delete articles older than `hours` hours and orphaned clusters.
-pub fn prune_old_articles(conn: &Connection, hours: u32) -> Result<(usize, usize)> {
-    let articles_deleted = conn.execute(
-        "DELETE FROM articles WHERE published_at < datetime('now', printf('-%d hours', ?1))",
-        params![hours],
+
+/// Move a single article to a new cluster (user-initiated split).
+/// Creates the new cluster row and deletes any old cluster that becomes empty.
+pub fn split_article_to_cluster(
+    conn: &Connection,
+    article_id: &str,
+    new_cluster_id: &str,
+    headline: &str,
+    published_at: &str,
+) -> Result<()> {
+    conn.execute(
+        "UPDATE articles SET cluster_id = ?1 WHERE id = ?2",
+        params![new_cluster_id, article_id],
     )?;
-    let clusters_deleted = conn.execute(
+    conn.execute(
+        "INSERT OR IGNORE INTO clusters (id, headline, first_reported, last_updated, is_blindspot)
+         VALUES (?1, ?2, ?3, ?4, 0)",
+        params![new_cluster_id, headline, published_at, published_at],
+    )?;
+    // Prune any cluster that now has no articles.
+    conn.execute(
         "DELETE FROM clusters WHERE id NOT IN (
              SELECT DISTINCT cluster_id FROM articles WHERE cluster_id IS NOT NULL
          )",
         [],
     )?;
-    Ok((articles_deleted, clusters_deleted))
+    Ok(())
+}
+
+/// Wipe all cluster assignments so the feed can be fully re-clustered.
+pub fn wipe_clusters(conn: &Connection) -> Result<()> {
+    conn.execute_batch(
+        "UPDATE articles SET cluster_id = NULL;
+         DELETE FROM clusters;",
+    )?;
+    Ok(())
+}
+
+/// Load every article in chronological order for re-clustering.
+/// Returns (id, original_headline, translated_headline, language, published_at).
+pub fn load_articles_for_recluster(
+    conn: &Connection,
+) -> Result<Vec<(String, String, String, String, String)>> {
+    let mut stmt = conn.prepare(
+        "SELECT id, headline, translated_headline, language, published_at
+         FROM articles
+         ORDER BY published_at ASC",
+    )?;
+    let rows = stmt
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2).unwrap_or_default(),
+                row.get::<_, String>(3)?,
+                row.get::<_, String>(4)?,
+            ))
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(rows)
 }
 
 /// Get (headline, translated_headline, language, publisher_id) for all articles in a cluster.
@@ -411,4 +477,34 @@ pub fn get_cluster_headlines(
         })?
         .collect::<Result<Vec<_>, _>>()?;
     Ok(rows)
+}
+
+/// Load headlines for ALL clusters in a single query, grouped by cluster_id.
+/// Avoids N+1 queries during blindspot analysis.
+pub fn load_all_cluster_headlines(
+    conn: &Connection,
+) -> Result<std::collections::HashMap<String, Vec<(String, String, String, String)>>> {
+    let mut stmt = conn.prepare(
+        "SELECT cluster_id, headline, translated_headline, language, publisher_id
+         FROM articles WHERE cluster_id IS NOT NULL",
+    )?;
+    let mut result: std::collections::HashMap<String, Vec<(String, String, String, String)>> =
+        std::collections::HashMap::new();
+    let rows = stmt.query_map([], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, String>(2).unwrap_or_default(),
+            row.get::<_, String>(3)?,
+            row.get::<_, String>(4)?,
+        ))
+    })?;
+    for row in rows {
+        let (cluster_id, headline, translated, language, publisher_id) = row?;
+        result
+            .entry(cluster_id)
+            .or_default()
+            .push((headline, translated, language, publisher_id));
+    }
+    Ok(result)
 }

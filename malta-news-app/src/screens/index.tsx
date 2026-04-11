@@ -2,11 +2,11 @@ import { useState, useEffect, useCallback, useRef, useMemo } from "react";
 import { useQueryClient } from "@tanstack/react-query";
 import { formatDistanceToNow } from "date-fns";
 import { invoke } from "@tauri-apps/api/core";
-import { useClusters, usePublishers, refreshFeed, addCustomPublisher, removeCustomPublisher, clusterKeys } from "@/api/clusters";
+import { useClusters, usePublishers, refreshFeed, addCustomPublisher, removeCustomPublisher, splitCluster, forceRecluster, clusterKeys } from "@/api/clusters";
 import { StoryCard } from "@/components/StoryCard/StoryCard";
 import { BiasBar } from "@/components/BiasBar/BiasBar";
 import { computeBiasCoverage } from "@/utils/bias";
-import { BIAS_COLORS } from "@/utils/constants";
+import { BIAS_COLORS, LOCAL_BIAS_OPTIONS, GLOBAL_BIAS_OPTIONS } from "@/utils/constants";
 import { articleHeadline, clusterHeadline } from "@/utils/headline";
 import { t } from "@/utils/i18n";
 import { useAppStore } from "@/store/useAppStore";
@@ -20,6 +20,8 @@ function usePullToRefresh(onRefresh: () => Promise<void>, enabled: boolean) {
   const [refreshing, setRefreshing] = useState(false);
   const startY = useRef(0);
   const isPulling = useRef(false);
+  const refreshingRef = useRef(false);
+  const pullDistanceRef = useRef(0);
   const THRESHOLD = 80;
 
   useEffect(() => {
@@ -27,7 +29,7 @@ function usePullToRefresh(onRefresh: () => Promise<void>, enabled: boolean) {
     if (!el || !enabled) return;
 
     const onTouchStart = (e: TouchEvent) => {
-      if (el.scrollTop <= 0) {
+      if (el.scrollTop <= 0 && !refreshingRef.current) {
         startY.current = e.touches[0].clientY;
         isPulling.current = true;
       }
@@ -37,21 +39,32 @@ function usePullToRefresh(onRefresh: () => Promise<void>, enabled: boolean) {
       const dy = e.touches[0].clientY - startY.current;
       if (dy > 0) {
         e.preventDefault();
-        setPullDistance(Math.min(dy * 0.5, 120));
+        const d = Math.min(dy * 0.5, 120);
+        pullDistanceRef.current = d;
+        setPullDistance(d);
       } else {
         isPulling.current = false;
+        pullDistanceRef.current = 0;
         setPullDistance(0);
       }
     };
     const onTouchEnd = async () => {
       if (!isPulling.current) return;
       isPulling.current = false;
-      if (pullDistance >= THRESHOLD) {
+      if (pullDistanceRef.current >= THRESHOLD) {
+        refreshingRef.current = true;
         setRefreshing(true);
         setPullDistance(THRESHOLD);
-        try { await onRefresh(); } finally { setRefreshing(false); setPullDistance(0); }
+        pullDistanceRef.current = THRESHOLD;
+        try { await onRefresh(); } finally {
+          refreshingRef.current = false;
+          setRefreshing(false);
+          setPullDistance(0);
+          pullDistanceRef.current = 0;
+        }
       } else {
         setPullDistance(0);
+        pullDistanceRef.current = 0;
       }
     };
 
@@ -63,10 +76,118 @@ function usePullToRefresh(onRefresh: () => Promise<void>, enabled: boolean) {
       el.removeEventListener("touchmove", onTouchMove);
       el.removeEventListener("touchend", onTouchEnd);
     };
-  }, [enabled, onRefresh, pullDistance]);
+  }, [enabled, onRefresh]); // pullDistance removed — use ref inside handlers
 
   const progress = Math.min(pullDistance / THRESHOLD, 1);
   return { containerRef, pullDistance, refreshing, progress };
+}
+
+// ── Swipe-to-Dismiss wrapper ────────────────────────────────────────────────
+
+function SwipeToDismiss({ children, onDismiss }: { children: React.ReactNode; onDismiss: () => void }) {
+  const [offsetX, setOffsetX] = useState(0);
+  const [dismissed, setDismissed] = useState(false);
+  const startX = useRef(0);
+  const startY = useRef(0);
+  const tracking = useRef(false);
+  const THRESHOLD = 110;
+
+  const handleTouchStart = (e: React.TouchEvent) => {
+    startX.current = e.touches[0].clientX;
+    startY.current = e.touches[0].clientY;
+    tracking.current = false;
+  };
+  const handleTouchMove = (e: React.TouchEvent) => {
+    const dx = e.touches[0].clientX - startX.current;
+    const dy = Math.abs(e.touches[0].clientY - startY.current);
+    // Only track if clearly horizontal
+    if (!tracking.current && Math.abs(dx) > 8 && dy < Math.abs(dx)) tracking.current = true;
+    if (!tracking.current) return;
+    if (dx < 0) setOffsetX(Math.max(dx, -180));
+  };
+  const handleTouchEnd = () => {
+    if (!tracking.current) return;
+    if (offsetX <= -THRESHOLD) {
+      setDismissed(true);
+      setTimeout(onDismiss, 280);
+    } else {
+      setOffsetX(0);
+    }
+    tracking.current = false;
+  };
+
+  const opacity = dismissed ? 0 : Math.max(0, 1 + offsetX / 180);
+  const scale   = dismissed ? 0.88 : Math.max(0.88, 1 + offsetX / 900);
+
+  return (
+    <div
+      onTouchStart={handleTouchStart}
+      onTouchMove={handleTouchMove}
+      onTouchEnd={handleTouchEnd}
+      style={{
+        transform: `translateX(${dismissed ? -320 : offsetX}px) scale(${scale})`,
+        opacity,
+        transition: (offsetX === 0 || dismissed) ? "transform 0.3s cubic-bezier(0.4,0,0.2,1), opacity 0.3s" : "none",
+        transformOrigin: "center left",
+      }}
+    >
+      {children}
+    </div>
+  );
+}
+
+// ── Swipe-to-remove row (reveals red action button on left swipe) ───────────
+
+function SwipeRow({ children, onAction, label }: {
+  children: React.ReactNode;
+  onAction: () => void;
+  label: string;
+}) {
+  const [offsetX, setOffsetX] = useState(0);
+  const startX = useRef(0);
+  const startY = useRef(0);
+  const tracking = useRef(false);
+  const PEEK = 72;
+  const THRESHOLD = 48;
+
+  const handleTouchStart = (e: React.TouchEvent) => {
+    startX.current = e.touches[0].clientX;
+    startY.current = e.touches[0].clientY;
+    tracking.current = false;
+  };
+  const handleTouchMove = (e: React.TouchEvent) => {
+    const dx = e.touches[0].clientX - startX.current;
+    const dy = Math.abs(e.touches[0].clientY - startY.current);
+    if (!tracking.current && Math.abs(dx) > 8 && dy < Math.abs(dx)) tracking.current = true;
+    if (!tracking.current) return;
+    if (dx < 0) setOffsetX(Math.max(dx, -PEEK));
+    else if (offsetX < 0) setOffsetX(Math.min(0, offsetX + (dx > 0 ? dx * 0.5 : 0)));
+  };
+  const handleTouchEnd = () => {
+    if (!tracking.current) { tracking.current = false; return; }
+    tracking.current = false;
+    setOffsetX(offsetX <= -THRESHOLD ? -PEEK : 0);
+  };
+
+  return (
+    <div className="swipe-row">
+      <button className="swipe-row-action" onClick={onAction} tabIndex={-1}>
+        <span>{label}</span>
+      </button>
+      <div
+        onTouchStart={handleTouchStart}
+        onTouchMove={handleTouchMove}
+        onTouchEnd={handleTouchEnd}
+        style={{
+          transform: `translateX(${offsetX}px)`,
+          transition: tracking.current ? "none" : "transform 0.22s ease",
+          background: "var(--color-bg)",
+        }}
+      >
+        {children}
+      </div>
+    </div>
+  );
 }
 
 // ── Extractive summary: merge first paragraphs from all sources into one ──
@@ -82,7 +203,9 @@ function combineSummary(bodyTexts: string[]): string {
   const allSentences: string[] = [];
   for (const t of texts) {
     const chunk = t.split("\n\n").slice(0, 2).join(" ");
-    const sentences = chunk.match(/[^.!?]+[.!?]+/g) || [chunk];
+    // Split on sentence boundaries only when followed by whitespace + capital letter,
+    // avoiding false splits on abbreviations like "Dr.", "U.S.", initials, etc.
+    const sentences = chunk.split(/(?<=[.!?])\s+(?=[A-Z])/).map(s => s.trim()).filter(Boolean);
     for (const s of sentences) {
       const trimmed = s.trim();
       if (trimmed.length > 25) allSentences.push(trimmed);
@@ -108,6 +231,19 @@ function combineSummary(bodyTexts: string[]): string {
   return picked.join(" ").slice(0, 500);
 }
 
+// ── HTML entity decoding ────────────────────────────────────────────────────
+
+const HTML_ENTITIES: Record<string, string> = {
+  "&amp;": "&", "&lt;": "<", "&gt;": ">", "&quot;": '"', "&#39;": "'",
+  "&nbsp;": " ", "&ndash;": "–", "&mdash;": "—", "&lsquo;": "\u2018",
+  "&rsquo;": "\u2019", "&ldquo;": "\u201C", "&rdquo;": "\u201D",
+  "&hellip;": "…", "&copy;": "©", "&reg;": "®", "&trade;": "™",
+};
+
+function decodeHTMLEntities(text: string): string {
+  return text.replace(/&[^;]+;/g, match => HTML_ENTITIES[match] ?? match);
+}
+
 // ── Story Detail Screen ─────────────────────────────────────────────────────
 
 export function StoryDetailScreen({
@@ -118,12 +254,15 @@ export function StoryDetailScreen({
   internalBackRef?: React.MutableRefObject<(() => void) | null>;
 }) {
   const lang = useAppStore(s => s.language);
+  const biasOverrides = useAppStore(s => s.publisherBiasOverrides);
+  const readerFontSize = useAppStore(s => s.readerFontSize);
+  const setReaderFontSize = useAppStore(s => s.setReaderFontSize);
   const [selectedArticle, setSelectedArticle] = useState<import("@/types").Article | null>(null);
   const [articleBody, setArticleBody] = useState<string>("");
   const [loadingBody, setLoadingBody] = useState(false);
   const [imgError, setImgError] = useState(false);
   const [logoErrors, setLogoErrors] = useState<Set<string>>(new Set());
-  const coverage = computeBiasCoverage(cluster.articles);
+  const coverage = computeBiasCoverage(cluster.articles, biasOverrides);
   const imageUrl = !imgError ? cluster.articles.find(a => a.image_url)?.image_url : undefined;
 
   const [summaries, setSummaries] = useState<Map<string, string>>(new Map());
@@ -211,10 +350,13 @@ export function StoryDetailScreen({
   // ── Article Reader View
   if (selectedArticle) {
     const a = selectedArticle;
-    const paragraphs = articleBody ? articleBody.split("\n\n").filter(Boolean) : [];
+    const paragraphs = articleBody ? articleBody.split("\n\n").filter(Boolean).map(decodeHTMLEntities) : [];
     const domain = a.original_url.replace(/^https?:\/\//, "").split("/")[0];
+    const wordCount = articleBody.split(/\s+/).filter(Boolean).length;
+    const readingMins = Math.max(1, Math.round(wordCount / 200));
 
     return (
+      <SwipeToDismiss onDismiss={() => setSelectedArticle(null)}>
       <div className="animate-fade-up detail-scroll">
         {a.image_url && (
           <div className="detail-hero">
@@ -226,31 +368,53 @@ export function StoryDetailScreen({
         <div className={`detail-content ${a.image_url ? "has-hero" : ""}`}>
           <div className="detail-publisher">
             <div className="source-avatar lg" style={{
-              backgroundColor: BIAS_COLORS[a.publisher.bias_category] ?? "#8E8E93",
+              backgroundColor: BIAS_COLORS[biasOverrides[a.publisher_id] ?? a.publisher.bias_category] ?? "#8E8E93",
             }}>
               {a.publisher.logo_url && !logoErrors.has(a.id) ? (
                 <img src={a.publisher.logo_url} alt={a.publisher.name}
                   onError={() => setLogoErrors(s => new Set(s).add(a.id))} />
               ) : (
-                <span>{a.publisher.name.charAt(0)}</span>
+                <span>{a.publisher.name.slice(0, 2).toUpperCase()}</span>
               )}
             </div>
-            <div>
+            <div style={{ flex: 1 }}>
               <p className="detail-pub-name">{a.publisher.name}</p>
-              <p className="detail-pub-time">{formatDistanceToNow(new Date(a.published_at), { addSuffix: true })}</p>
+              <p className="detail-pub-time">
+                {formatDistanceToNow(new Date(a.published_at), { addSuffix: true })}
+                {paragraphs.length > 0 && (
+                  <span className="reading-time"> · ~{readingMins} {t(lang, "minRead")}</span>
+                )}
+              </p>
+            </div>
+            {/* Font size controls */}
+            <div className="font-controls">
+              <button
+                className="font-btn"
+                onClick={() => setReaderFontSize(readerFontSize === "lg" ? "md" : "sm")}
+                aria-label="Decrease font size"
+              >A−</button>
+              <button
+                className="font-btn"
+                onClick={() => setReaderFontSize(readerFontSize === "sm" ? "md" : "lg")}
+                aria-label="Increase font size"
+              >A+</button>
             </div>
           </div>
 
           <h2 className="detail-headline">{articleHeadline(a, lang)}</h2>
 
           {paragraphs.length > 0 ? (
-            <div className="detail-body">
+            <div className={`detail-body font-${readerFontSize}`}>
               {paragraphs.map((p, i) => (<p key={i}>{p}</p>))}
             </div>
           ) : loadingBody ? (
             <div className="detail-loading">
               <div className="spinner" />
               <span>{t(lang, "loadingArticle")}</span>
+            </div>
+          ) : a.snippet ? (
+            <div className={`detail-body font-${readerFontSize}`}>
+              <p>{decodeHTMLEntities(a.snippet)}</p>
             </div>
           ) : (
             <div className="detail-empty-body">{t(lang, "noBodyText")}</div>
@@ -270,10 +434,25 @@ export function StoryDetailScreen({
           </button>
         </div>
       </div>
+      </SwipeToDismiss>
     );
   }
 
   // ── Cluster Overview with combined summary
+  const sortedByTime = useMemo(() =>
+    [...cluster.articles].sort((a, b) => a.published_at.localeCompare(b.published_at)),
+  [cluster.articles]);
+
+  const plArticle = useMemo(() =>
+    cluster.articles.find(a => (biasOverrides[a.publisher_id] ?? a.publisher.bias_category) === "party_owned_pl"),
+  [cluster.articles, biasOverrides]);
+
+  const pnArticle = useMemo(() =>
+    cluster.articles.find(a => (biasOverrides[a.publisher_id] ?? a.publisher.bias_category) === "party_owned_pn"),
+  [cluster.articles, biasOverrides]);
+
+  const [compareOpen, setCompareOpen] = useState(false);
+
   return (
     <div className="animate-fade-up detail-scroll">
       {imageUrl && (
@@ -305,30 +484,95 @@ export function StoryDetailScreen({
           <BiasBar coverage={coverage} />
         </div>
 
+        {/* ── Both-sides compare ── */}
+        {plArticle && pnArticle && (
+          <div className="compare-section">
+            <button className="compare-toggle" onClick={() => setCompareOpen(o => !o)}>
+              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                <path d="M18 3H6a3 3 0 0 0-3 3v12a3 3 0 0 0 3 3h12a3 3 0 0 0 3-3V6a3 3 0 0 0-3-3z" />
+                <line x1="12" y1="3" x2="12" y2="21" />
+              </svg>
+              {t(lang, "compareFraming")}
+              <svg className={`compare-chevron ${compareOpen ? "open" : ""}`} width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round">
+                <path d="M6 9l6 6 6-6" />
+              </svg>
+            </button>
+            {compareOpen && (
+              <div className="compare-cols">
+                <div className="compare-col pl">
+                  <span className="compare-label" style={{ color: BIAS_COLORS.party_owned_pl }}>{t(lang, "labourSays")}</span>
+                  <p className="compare-headline">{articleHeadline(plArticle, lang)}</p>
+                  {plArticle.snippet && <p className="compare-snippet">{plArticle.snippet}</p>}
+                </div>
+                <div className="compare-divider" />
+                <div className="compare-col pn">
+                  <span className="compare-label" style={{ color: BIAS_COLORS.party_owned_pn }}>{t(lang, "nationalistSays")}</span>
+                  <p className="compare-headline">{articleHeadline(pnArticle, lang)}</p>
+                  {pnArticle.snippet && <p className="compare-snippet">{pnArticle.snippet}</p>}
+                </div>
+              </div>
+            )}
+          </div>
+        )}
+
         <div className="source-headlines">
           {cluster.articles.map(a => (
-            <button key={a.id} className="source-headline-row" onClick={() => openArticle(a)}>
-              <div className="source-avatar sm" style={{
-                backgroundColor: BIAS_COLORS[a.publisher.bias_category] ?? "#8E8E93",
-              }}>
-                {a.publisher.logo_url && !logoErrors.has(a.id) ? (
-                  <img src={a.publisher.logo_url} alt={a.publisher.name}
-                    onError={() => setLogoErrors(s => new Set(s).add(a.id))} />
-                ) : (
-                  <span>{a.publisher.name.charAt(0)}</span>
-                )}
-              </div>
-              <div className="source-headline-text">
-                <p className="source-headline">
-                  {articleHeadline(a, lang)}
-                </p>
-                <span className="source-headline-meta">
-                  {a.publisher.name} · {formatDistanceToNow(new Date(a.published_at), { addSuffix: true })}
-                </span>
-              </div>
-            </button>
+            <SwipeRow
+              key={a.id}
+              label={t(lang, "splitFromCluster")}
+              onAction={async () => {
+                const headline = a.language === "en" ? a.original_headline : (a.translated_headline || a.original_headline);
+                await splitCluster(a.id, headline, a.published_at).catch(() => {});
+                // Parent will re-fetch on next query invalidation; for now just show the detail gone.
+              }}
+            >
+              <button className="source-headline-row" onClick={() => openArticle(a)}>
+                <div className="source-avatar sm" style={{
+                  backgroundColor: BIAS_COLORS[biasOverrides[a.publisher_id] ?? a.publisher.bias_category] ?? "#8E8E93",
+                }}>
+                  {a.publisher.logo_url && !logoErrors.has(a.id) ? (
+                    <img src={a.publisher.logo_url} alt={a.publisher.name}
+                      onError={() => setLogoErrors(s => new Set(s).add(a.id))} />
+                  ) : (
+                    <span>{a.publisher.name.slice(0, 2).toUpperCase()}</span>
+                  )}
+                </div>
+                <div className="source-headline-text">
+                  <p className="source-headline">
+                    {articleHeadline(a, lang)}
+                  </p>
+                  <span className="source-headline-meta">
+                    {a.publisher.name} · {formatDistanceToNow(new Date(a.published_at), { addSuffix: true })}
+                  </span>
+                </div>
+              </button>
+            </SwipeRow>
           ))}
         </div>
+
+        {/* ── Story timeline ── */}
+        {sortedByTime.length > 1 && (
+          <div className="timeline-section">
+            <p className="settings-label">{t(lang, "storyTimeline")}</p>
+            <div className="timeline-list">
+              {sortedByTime.map((a, i) => (
+                <div key={a.id} className="timeline-item">
+                  <div className="timeline-track">
+                    <div className="timeline-dot" style={{ background: BIAS_COLORS[biasOverrides[a.publisher_id] ?? a.publisher.bias_category] ?? "#8E8E93" }} />
+                    {i < sortedByTime.length - 1 && <div className="timeline-line" />}
+                  </div>
+                  <div className="timeline-text">
+                    <span className="timeline-pub">
+                      {a.publisher.name}
+                      {i === 0 && <span className="timeline-first"> · {t(lang, "brokeTheStory")}</span>}
+                    </span>
+                    <span className="timeline-time">{formatDistanceToNow(new Date(a.published_at), { addSuffix: true })}</span>
+                  </div>
+                </div>
+              ))}
+            </div>
+          </div>
+        )}
       </div>
     </div>
   );
@@ -363,6 +607,16 @@ const CAT_I18N: Record<string, import("@/utils/i18n").LangKey> = {
 
 export type FeedFilter = "local" | "global";
 
+const INDEPENDENT_BIAS: BiasCategory[] = ["commercial_independent", "investigative_independent"];
+
+function recomputeBlindspot(articles: StoryCluster["articles"], overrides: Record<string, BiasCategory>): boolean {
+  if (!articles.length) return false;
+  return !articles.some(a => {
+    const cat = overrides[a.publisher_id] ?? a.publisher.bias_category;
+    return INDEPENDENT_BIAS.includes(cat);
+  });
+}
+
 export function FeedScreen({
   onSelectCluster,
   filter = "local",
@@ -373,12 +627,14 @@ export function FeedScreen({
   const lang = useAppStore(s => s.language);
   const localDisabledPublisherIds = useAppStore(s => s.localDisabledPublisherIds);
   const globalDisabledPublisherIds = useAppStore(s => s.globalDisabledPublisherIds);
+  const biasOverrides = useAppStore(s => s.publisherBiasOverrides);
   const queryClient = useQueryClient();
   const { data, isLoading, isError, refetch } = useClusters();
   const [refreshing, setRefreshing] = useState(false);
   const [shuffleKey, setShuffleKey] = useState(0);
   const [activeCategory, setActiveCategory] = useState<"all" | Category>("all");
   const [failedSources, setFailedSources] = useState<string[]>([]);
+  const [dismissedIds, setDismissedIds] = useState<Set<string>>(new Set());
 
   const rawClusters = data?.clusters ?? [];
 
@@ -406,13 +662,18 @@ export function FeedScreen({
     // then drop clusters that have no articles left.
     const disabledPubs = filter === "local" ? localDisabledPublisherIds : globalDisabledPublisherIds;
     arr = arr
-      .map(c => ({
-        ...c,
-        articles: c.articles.filter(a =>
+      .map(c => {
+        const articles = c.articles.filter(a =>
           (filter === "local" ? !a.publisher.is_global : a.publisher.is_global) &&
           !disabledPubs.includes(a.publisher_id)
-        ),
-      }))
+        );
+        return {
+          ...c,
+          articles,
+          // Re-evaluate blindspot using user's bias overrides so the flag stays accurate.
+          is_blindspot: articles.length ? recomputeBlindspot(articles, biasOverrides) : c.is_blindspot,
+        };
+      })
       .filter(c => c.articles.length > 0);
 
     // Apply category filter.
@@ -424,7 +685,7 @@ export function FeedScreen({
       (shuffleScores.current.get(b.id) ?? 0) - (shuffleScores.current.get(a.id) ?? 0)
     );
     return arr;
-  }, [rawClusters, shuffleKey, activeCategory, filter, localDisabledPublisherIds, globalDisabledPublisherIds]);
+  }, [rawClusters, shuffleKey, activeCategory, filter, localDisabledPublisherIds, globalDisabledPublisherIds, biasOverrides]);
 
   const handleRefresh = useCallback(async () => {
     setRefreshing(true);
@@ -545,13 +806,17 @@ export function FeedScreen({
       )}
 
       <div className="feed-list">
-        {clusters.map((c, i) => (
-          <StoryCard
+        {clusters.filter(c => !dismissedIds.has(c.id)).map((c, i) => (
+          <SwipeToDismiss
             key={c.id}
-            cluster={c}
-            onPress={onSelectCluster}
-            animationDelay={`${Math.min(i * 0.05, 0.3)}s`}
-          />
+            onDismiss={() => setDismissedIds(s => new Set(s).add(c.id))}
+          >
+            <StoryCard
+              cluster={c}
+              onPress={onSelectCluster}
+              animationDelay={`${Math.min(i * 0.05, 0.3)}s`}
+            />
+          </SwipeToDismiss>
         ))}
       </div>
 
@@ -567,14 +832,22 @@ function SourceRow({
   onAction,
   isLast,
   dimmed = false,
+  articleCount,
 }: {
   publisher: import("@/types").Publisher;
   action: "remove" | "add" | "delete";
   onAction: () => void;
   isLast: boolean;
   dimmed?: boolean;
+  articleCount?: number;
 }) {
-  const dotColor = (BIAS_COLORS as Record<string, string>)[publisher.bias_category] ?? "#8E8E93";
+  const lang = useAppStore(s => s.language);
+  const biasOverrides = useAppStore(s => s.publisherBiasOverrides);
+  const setPublisherBias = useAppStore(s => s.setPublisherBias);
+  const defaultBias = publisher.is_global ? "centre" : publisher.bias_category;
+  const effectiveBias = biasOverrides[publisher.id] ?? defaultBias;
+  const dotColor = (BIAS_COLORS as Record<string, string>)[effectiveBias] ?? "#8E8E93";
+  const biasOptions = publisher.is_global ? GLOBAL_BIAS_OPTIONS : LOCAL_BIAS_OPTIONS;
   return (
     <div
       className="settings-row"
@@ -582,7 +855,24 @@ function SourceRow({
     >
       <div className="publisher-row-info">
         <span className="publisher-dot" style={{ background: dotColor }} />
-        <span className="settings-row-label">{publisher.name}</span>
+        <div className="publisher-name-bias">
+          <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
+            <span className="settings-row-label">{publisher.name}</span>
+            {articleCount !== undefined && articleCount > 0 && (
+              <span className="publisher-count">{articleCount} {t(lang, "articlesToday")}</span>
+            )}
+          </div>
+          <select
+            className="bias-select"
+            value={effectiveBias}
+            onChange={e => setPublisherBias(publisher.id, e.target.value as import("@/types").BiasCategory)}
+            onClick={e => e.stopPropagation()}
+          >
+            {biasOptions.map(([value, label]) => (
+              <option key={value} value={value}>{label}</option>
+            ))}
+          </select>
+        </div>
       </div>
       <button
         className={action === "add" ? "source-add-btn" : "source-remove-btn"}
@@ -601,12 +891,14 @@ function SourcesSection({
   isEnabled,
   onToggle,
   onDelete,
+  articleCounts = {},
 }: {
   label: string;
   publishers: import("@/types").Publisher[];
   isEnabled: (id: string) => boolean;
   onToggle: (id: string) => void;
   onDelete?: (id: string) => void;
+  articleCounts?: Record<string, number>;
 }) {
   const sorted = [...publishers].sort((a, b) => a.name.localeCompare(b.name));
   return (<>
@@ -623,6 +915,7 @@ function SourcesSection({
               onAction={() => onDelete ? onDelete(p.id) : onToggle(p.id)}
               isLast={i === sorted.length - 1}
               dimmed={!onDelete && !enabled}
+              articleCount={articleCounts[p.id]}
             />
           );
         })}
@@ -691,17 +984,33 @@ export function SettingsScreen() {
   const { theme, setTheme, language, setLanguage, toggleLocalPublisher, toggleGlobalPublisher,
     isLocalPublisherEnabled, isGlobalPublisherEnabled } = useAppStore();
   const queryClient = useQueryClient();
+  const [reclustering, setReclustering] = useState(false);
   const { data: publishers = [] } = usePublishers();
 
   const localPublishers = publishers.filter(p => !p.is_global).sort((a, b) => a.name.localeCompare(b.name));
   const globalPublishers = publishers.filter(p => p.is_global).sort((a, b) => a.name.localeCompare(b.name));
 
+  // Compute article counts per publisher from the cached cluster data (no extra fetch needed).
+  const articleCounts = useMemo(() => {
+    const cached = queryClient.getQueryData<import("@/types").ClustersResponse>(clusterKeys.list({}));
+    const counts: Record<string, number> = {};
+    for (const cluster of cached?.clusters ?? []) {
+      for (const article of cluster.articles) {
+        counts[article.publisher_id] = (counts[article.publisher_id] ?? 0) + 1;
+      }
+    }
+    return counts;
+  }, [queryClient]);
+
   const invalidatePublishers = () => queryClient.invalidateQueries({ queryKey: ["publishers"] });
+  const invalidateClusters = () => queryClient.invalidateQueries({ queryKey: clusterKeys.all() });
 
   const handleDeleteCustom = async (id: string) => {
     try {
       await removeCustomPublisher(id);
       invalidatePublishers();
+      // Articles from this publisher are deleted from DB, so clusters must be re-fetched.
+      invalidateClusters();
     } catch (e) {
       console.error("Failed to remove publisher:", e);
     }
@@ -748,6 +1057,7 @@ export function SettingsScreen() {
         publishers={localPublishers}
         isEnabled={isLocalPublisherEnabled}
         onToggle={toggleLocalPublisher}
+        articleCounts={articleCounts}
       />
 
       {/* Add Malta Source */}
@@ -766,6 +1076,7 @@ export function SettingsScreen() {
                 action="delete"
                 onAction={() => handleDeleteCustom(p.id)}
                 isLast={i === globalPublishers.length - 1}
+                articleCount={articleCounts[p.id]}
               />
             ))}
           </div>
@@ -776,10 +1087,27 @@ export function SettingsScreen() {
       <p className="settings-label" style={{ marginTop: 28 }}>{t(language, "addInternationalSource")}</p>
       <AddSourceForm isGlobal={true} onAdded={invalidatePublishers} />
 
+      {/* Re-cluster */}
+      <p className="settings-label" style={{ marginTop: 28 }}>{t(language, "forceRecluster")}</p>
+      <button
+        className="danger-btn"
+        disabled={reclustering}
+        onClick={async () => {
+          setReclustering(true);
+          try {
+            await forceRecluster();
+            queryClient.invalidateQueries({ queryKey: clusterKeys.all() });
+          } catch (e) { console.error(e); }
+          finally { setReclustering(false); }
+        }}
+      >
+        {reclustering ? t(language, "reclustering") : t(language, "forceRecluster")}
+      </button>
+
       {/* About */}
       <div className="settings-about">
-        <div className="app-icon lg"><span>H</span></div>
-        <p className="settings-app-name">Ħabbar</p>
+        <div className="app-icon lg"><img src="/app-icon.png" alt="Merill" /></div>
+        <p className="settings-app-name">Merill</p>
         <p className="settings-version">v0.1.0</p>
       </div>
     </div>

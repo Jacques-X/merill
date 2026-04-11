@@ -2,7 +2,7 @@ import { useState, useEffect, useCallback, useRef } from "react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { FeedScreen, SettingsScreen, StoryDetailScreen } from "@/screens";
 import type { FeedFilter } from "@/screens";
-import { useAppStore } from "@/store/useAppStore";
+import { useAppStore, sessionBaseline } from "@/store/useAppStore";
 import { t } from "@/utils/i18n";
 import type { StoryCluster } from "@/types";
 import "@/index.css";
@@ -92,6 +92,16 @@ function BottomDock({
 function AppShell() {
   useThemeSync();
   const lang = useAppStore(s => s.language);
+  const touchLastOpened = useAppStore(s => s.touchLastOpened);
+
+  useEffect(() => {
+    // Snapshot the persisted value as our session baseline BEFORE we overwrite it,
+    // so StoryCard can compare against it for "New" badges.
+    sessionBaseline.current = useAppStore.getState().lastOpenedAt;
+    // Record now for the NEXT session's comparison.
+    touchLastOpened();
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
   const [selectedCluster, setSelectedCluster] = useState<StoryCluster | null>(null);
   const [showSettings, setShowSettings] = useState(false);
   const [activeTab, setActiveTab] = useState<FeedFilter>("local");
