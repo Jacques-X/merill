@@ -1,0 +1,204 @@
+{
+  "generated": "2026-04-29",
+  "context": "Brainstorm of improvements to Merill's scraping and clustering pipeline.",
+  "grouping": [
+    {
+      "id": 1,
+      "title": "Use article body, not just headline + snippet",
+      "impact": "high",
+      "effort": "medium",
+      "files": ["src-tauri/src/pipeline.rs:139", "src-tauri/src/scraper.rs:557"],
+      "problem": "HTML-scraped publishers (Malta Today, Independent, TVM) have empty body_snippet, so RSS articles cluster better than HTML ones — uneven by source.",
+      "proposal": "Fetch body text per article and add a body bag-of-words at lower weight (~0.3x) to the TF-IDF input.",
+      "tradeoff": "Extra HTTP per article; mitigate with lazy/queued fetching after initial cluster assignment."
+    },
+    {
+      "id": 2,
+      "title": "Maltese-specific stop words + tokenizer",
+      "impact": "high",
+      "effort": "low",
+      "files": ["src-tauri/src/clustering.rs:25", "src-tauri/src/clustering.rs:148"],
+      "problem": "STOP_WORDS is English-only. MT articles leak tokens like 'ta', 'il', 'tal' through the !is_alphanumeric splitter; apostrophes (f'Malta) break tokenization.",
+      "proposal": "Add MT stop list; strip leading-article prefixes (il-, it-, ix-, ta', tal-, tas-, f') before tokenizing.",
+      "tradeoff": "None significant; pure correctness fix."
+    },
+    {
+      "id": 3,
+      "title": "Category gating",
+      "impact": "medium",
+      "effort": "low",
+      "files": ["src-tauri/src/category.rs", "src-tauri/src/clustering.rs:335"],
+      "problem": "Sport and politics articles can theoretically cluster if vocabulary overlaps.",
+      "proposal": "Refuse to consider candidate clusters whose category differs from the new article's category.",
+      "tradeoff": "Misclassified articles get isolated; mitigate by allowing 'general' category to match anything."
+    },
+    {
+      "id": 4,
+      "title": "URL slug as additional clustering signal",
+      "impact": "high",
+      "effort": "low",
+      "files": ["src-tauri/src/pipeline.rs:139"],
+      "problem": "SEO slugs (/news/labour-leader-resigns-after-…) are dense, descriptive, and ignored by current clustering.",
+      "proposal": "Tokenize the URL slug and merge into cluster text at weight ~1.5x; robust to translation mismatches.",
+      "tradeoff": "Some publishers use opaque URLs (numeric IDs); skip when slug has <2 word-tokens."
+    },
+    {
+      "id": 5,
+      "title": "Lightweight NER instead of capitalisation heuristic",
+      "impact": "high",
+      "effort": "medium",
+      "files": ["src-tauri/src/clustering.rs:158"],
+      "problem": "Current proper-noun rule misses sentence-initial entities and trips on mid-sentence capitals.",
+      "proposal": "Rule-based pass with known Malta entities (parties: PL, PN, ADPD; people: Abela, Grech; institutions: MEPA, Transport Malta) + capitalised-bigram grouping.",
+      "tradeoff": "Entity list needs occasional manual updates; can also be derived from publisher metadata."
+    },
+    {
+      "id": 6,
+      "title": "Cluster centroid + same-publisher threshold bump",
+      "impact": "medium",
+      "effort": "medium",
+      "files": ["src-tauri/src/clustering.rs:348"],
+      "problem": "Greedy O(n) iteration over every headline per cluster; same-publisher articles can join one cluster, undermining the cross-publisher product premise.",
+      "proposal": "(a) Maintain a mean TF-IDF vector per cluster, score against centroid. (b) Raise threshold slightly when candidate cluster already contains the article's publisher.",
+      "tradeoff": "Centroids smooth out outliers — keep per-headline scoring as fallback for borderline scores."
+    },
+    {
+      "id": 7,
+      "title": "Second-pass cluster-to-cluster merge",
+      "impact": "medium",
+      "effort": "medium",
+      "files": ["src-tauri/src/pipeline.rs:122"],
+      "problem": "Greedy single-pass means an article that arrives before its companions seeds a singleton that should have merged.",
+      "proposal": "After greedy assignment, run centroid-vs-centroid sweep and merge clusters above a high threshold (~0.55).",
+      "tradeoff": "Risk of over-merging; gate by minimum-shared-anchor requirement."
+    },
+    {
+      "id": 8,
+      "title": "Time-aware similarity boost",
+      "impact": "medium",
+      "effort": "low",
+      "files": ["src-tauri/src/clustering.rs:351"],
+      "problem": "Stale clusters are penalised, but fresh-vs-fresh proximity is not rewarded.",
+      "proposal": "Multiplicative boost: score *= 1 + 0.2 * exp(-Δh/12) — favours clusters within ~6h of the new article.",
+      "tradeoff": "Tune decay constant against real refresh data."
+    },
+    {
+      "id": 9,
+      "title": "Optional embedding tie-breaker for ambiguous matches",
+      "impact": "high",
+      "effort": "high",
+      "files": ["src-tauri/src/clustering.rs:316"],
+      "problem": "Lexical TF-IDF can't bridge synonyms ('Cabinet approves law' vs 'Government passes legislation').",
+      "proposal": "When TF-IDF score lands in 0.18–0.34 gray zone, run small on-device sentence encoder (MiniLM-L6 ONNX, ~80MB, ~5ms/headline) as tie-breaker.",
+      "tradeoff": "Adds dependency + binary size; only used for ambiguous candidates so latency cost is bounded."
+    },
+    {
+      "id": 10,
+      "title": "Adaptive threshold by cluster size",
+      "impact": "medium",
+      "effort": "low",
+      "files": ["src-tauri/src/clustering.rs:73"],
+      "problem": "Constant threshold lets large clusters become magnets and prevents fledgling clusters from accreting.",
+      "proposal": "Mature clusters (≥5 articles) raise threshold by ~0.05; tentative clusters (1–2) lower by ~0.03.",
+      "tradeoff": "Hyperparameters need tuning; verify with a labelled subset."
+    },
+    {
+      "id": 19,
+      "title": "Enrich MT clustering text with original entity tokens",
+      "impact": "medium",
+      "effort": "low",
+      "files": ["src-tauri/src/pipeline.rs:128", "src-tauri/src/translate.rs"],
+      "problem": "If translator drops/mangles proper nouns, anchor matching for MT articles dies.",
+      "proposal": "Append proper nouns and numbers from the MT original alongside the EN translation when building cluster text.",
+      "tradeoff": "Slightly noisier vocabulary; offset by stop-word filter."
+    }
+  ],
+  "scraping": [
+    {
+      "id": 11,
+      "title": "URL canonicalisation before stable_id",
+      "impact": "high",
+      "effort": "low",
+      "files": ["src-tauri/src/scraper.rs:10"],
+      "problem": "Raw URL hash means ?utm_source=…, #comments, trailing slash, ?replytocom= variants create duplicate article IDs.",
+      "proposal": "Strip query params (allowlist of meaningful ones), fragments, normalise scheme/host case, and trailing slash before hashing.",
+      "tradeoff": "Some publishers use query params for legitimate IDs (?p=123); allowlist them."
+    },
+    {
+      "id": 12,
+      "title": "Replace string-based sitemap parser with quick-xml",
+      "impact": "medium",
+      "effort": "medium",
+      "files": ["src-tauri/src/scraper.rs:584", "src-tauri/src/scraper.rs:736"],
+      "problem": "split('<url>') + substring searches break on namespaced tags, multi-line attributes, and CDATA edge cases — silent drops.",
+      "proposal": "Switch to quick-xml streaming parser; preserve structure and handle CDATA/namespaces.",
+      "tradeoff": "More code, but standard pattern."
+    },
+    {
+      "id": 13,
+      "title": "Conditional GET (ETag / If-Modified-Since)",
+      "impact": "high",
+      "effort": "medium",
+      "files": ["src-tauri/src/scraper.rs:297", "src-tauri/src/db.rs"],
+      "problem": "RSS feeds rarely change between 15-min refetches; we re-download the full body each time.",
+      "proposal": "Persist last ETag / Last-Modified per source; send the conditional headers; treat 304 as 'no new articles'.",
+      "tradeoff": "Schema migration to store headers; minimal."
+    },
+    {
+      "id": 14,
+      "title": "Per-host concurrency limit + per-future timeout",
+      "impact": "medium",
+      "effort": "low",
+      "files": ["src-tauri/src/scraper.rs:955"],
+      "problem": "join_all blasts all publishers in parallel — one slow site holds up the whole user-visible refresh.",
+      "proposal": "Wrap each fetch in tokio::time::timeout (~10s); cap concurrency at ~5 with a Semaphore.",
+      "tradeoff": "Slightly slower in the happy path; predictable worst case."
+    },
+    {
+      "id": 15,
+      "title": "Per-publisher health metrics + selector auto-fallback",
+      "impact": "high",
+      "effort": "medium",
+      "files": ["src-tauri/src/scraper.rs:714", "src-tauri/src/db.rs"],
+      "problem": "Static selectors silently break when sites redesign; auto_detect_article_sel exists but only runs for custom publishers.",
+      "proposal": "Track scraped count per publisher; if 0 or <expected/3 for two consecutive refreshes, retry via auto_detect_article_sel and surface 'stale source' to the UI.",
+      "tradeoff": "Need a baseline/expected count per publisher; can be a rolling median."
+    },
+    {
+      "id": 16,
+      "title": "Readability-style article body extraction",
+      "impact": "high",
+      "effort": "medium",
+      "files": ["src-tauri/src/scraper.rs:557"],
+      "problem": "Fixed container selectors + <p>-length heuristic miss reformatted layouts.",
+      "proposal": "Use dom_smoothie or readable-readability crate; powers idea #1 (body in clustering).",
+      "tradeoff": "Adds a dependency; consider feature-flagging while validating."
+    },
+    {
+      "id": 17,
+      "title": "Don't fake published_at on bad sitemap dates",
+      "impact": "low",
+      "effort": "low",
+      "files": ["src-tauri/src/scraper.rs:632", "src-tauri/src/scraper.rs:769"],
+      "problem": "Falling back to Utc::now() makes parse-failed articles look artificially fresh and skews stale-cluster checks.",
+      "proposal": "Skip the article, or carry None and exclude from time-sensitive logic.",
+      "tradeoff": "Some real articles get dropped; logging will reveal frequency."
+    },
+    {
+      "id": 18,
+      "title": "Size-aware image selection + cluster-level best image",
+      "impact": "medium",
+      "effort": "low",
+      "files": ["src-tauri/src/scraper.rs:60", "src-tauri/src/scraper.rs:186"],
+      "problem": "First 'good' image wins; placeholders sometimes appear first. UI shows inconsistent imagery across articles in a cluster.",
+      "proposal": "Parse og:image:width/srcset widths, prefer ≥600px; choose a single cluster-level image (largest or from highest-scored publisher).",
+      "tradeoff": "More HTML parsing; bounded since we already iterate <img>."
+    }
+  ],
+  "priority_groups": {
+    "engineering_quick_wins": [11, 13, 14, 1],
+    "malta_specific": [2, 3, 5, 15],
+    "biggest_quality_jump": [9],
+    "low_effort_correctness": [11, 17, 12]
+  }
+}

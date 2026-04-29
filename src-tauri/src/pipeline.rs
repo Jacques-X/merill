@@ -10,16 +10,90 @@ use crate::models::RawArticle;
 use crate::scraper;
 use crate::translate;
 
-/// Build the text used for TF-IDF clustering: "[headline] . [snippet]".
-/// The snippet adds disambiguating context without losing the dense topic signal
-/// of the headline. Falls back to headline-only when the snippet is empty.
-fn cluster_text(headline: &str, snippet: &str) -> String {
-    let s = snippet.trim();
-    if s.is_empty() {
-        headline.to_string()
+// ── Cluster text helpers ─────────────────────────────────────────────────────
+
+/// Extract word-like tokens from the URL slug and return them space-joined.
+/// Skips numeric-only segments and slugs with fewer than 2 word tokens. (#4)
+fn url_slug_words(url: &str) -> String {
+    let after_scheme = url.find("://").map(|i| i + 3).unwrap_or(0);
+    let host_end = url[after_scheme..]
+        .find('/')
+        .map(|i| after_scheme + i)
+        .unwrap_or(url.len());
+    let path = &url[host_end..];
+
+    let slug = path
+        .split('/')
+        .filter(|s| !s.is_empty())
+        .last()
+        .unwrap_or("");
+    let slug = slug.split('.').next().unwrap_or(slug); // strip extension
+
+    let words: Vec<&str> = slug
+        .split(|c: char| c == '-' || c == '_')
+        .filter(|w| w.len() > 3 && !w.chars().all(|c| c.is_ascii_digit()))
+        .collect();
+
+    if words.len() < 2 {
+        String::new()
     } else {
-        format!("{} . {}", headline, s)
+        words.join(" ")
     }
+}
+
+/// Build the text used for TF-IDF clustering:
+///   "[headline] . [snippet] . [url-slug-words]"
+/// Falls back to headline-only when snippet and slug are empty. (#4)
+fn cluster_text(headline: &str, snippet: &str, url: &str) -> String {
+    let mut parts = vec![headline.to_string()];
+    let s = snippet.trim();
+    if !s.is_empty() {
+        parts.push(s.to_string());
+    }
+    let slug = url_slug_words(url);
+    if !slug.is_empty() {
+        parts.push(slug);
+    }
+    parts.join(" . ")
+}
+
+/// Extract capitalised words and numbers from a Maltese headline to append to
+/// the English cluster text. Guards against translators mangling proper nouns. (#19)
+fn mt_entity_words(mt_headline: &str) -> String {
+    let words: Vec<&str> = mt_headline
+        .split_whitespace()
+        .filter(|w| {
+            // Strip leading punctuation to get a clean first char
+            let clean = w.trim_matches(|c: char| !c.is_alphanumeric());
+            if clean.len() < 3 {
+                return false;
+            }
+            let first = clean.chars().next().unwrap();
+            first.is_uppercase() || clean.chars().all(|c| c.is_ascii_digit() || c == '.')
+        })
+        .collect();
+    words.join(" ")
+}
+
+/// Determine the dominant category for a set of per-article categories.
+/// Returns "general" if articles span multiple categories.
+fn dominant_category(cats: &[&str]) -> String {
+    if cats.is_empty() {
+        return "general".to_string();
+    }
+    let mut counts: HashMap<&str, usize> = HashMap::new();
+    for &c in cats {
+        *counts.entry(c).or_insert(0) += 1;
+    }
+    if counts.len() == 1 {
+        return cats[0].to_string();
+    }
+    counts
+        .into_iter()
+        .max_by_key(|(_, c)| *c)
+        .filter(|(_, c)| *c >= 2) // require at least 2 votes
+        .map(|(k, _)| k.to_string())
+        .unwrap_or_else(|| "general".to_string())
 }
 
 pub struct PipelineResult {
@@ -36,7 +110,7 @@ fn process(
 ) -> Result<PipelineResult> {
     let scraped_count = raw_articles.len();
 
-    // 1. Store new articles (with translated headlines) in a single transaction.
+    // 1. Store new articles in a single transaction.
     let new_articles = {
         let conn = db.get()?;
         conn.execute_batch("BEGIN")?;
@@ -73,28 +147,33 @@ fn process(
 
     let conn = db.get()?;
 
-    // 2. Build cluster data map (headlines + pre-tokenized forms + last_updated per cluster).
-    // Use a single bulk query to avoid N+1 per-cluster fetches.
-    // Keep pub_map and article_data alive so step 4 (blindspot) can reuse them after
-    // augmenting with newly assigned articles — avoiding a second full-table DB scan.
+    // 2. Build cluster data map from DB.
     // pub_map: cluster_id → (first_reported, last_updated, publisher_ids)
     let mut pub_map: HashMap<String, (String, String, Vec<String>)> =
         db::load_cluster_publishers(&conn)?
             .into_iter()
             .map(|(cid, _, first, last, pubs)| (cid, (first, last, pubs)))
             .collect();
-    let mut article_data: HashMap<String, Vec<(String, String, String, String, String)>> =
+    // article_data: cluster_id → Vec<(headline, translated, language, publisher_id, snippet, category)>
+    let mut article_data: HashMap<String, Vec<(String, String, String, String, String, String)>> =
         db::load_all_cluster_headlines(&conn)?;
 
     let mut cluster_data: HashMap<String, clustering::ClusterData> = HashMap::new();
-    for (cid, (_, last_updated, _)) in &pub_map {
+    for (cid, (_, last_updated, pubs)) in &pub_map {
         let articles = article_data.get(cid).map(|v| v.as_slice()).unwrap_or(&[]);
-        let mut headlines: Vec<String> = Vec::with_capacity(articles.len());
-        let mut tokenized_headlines: Vec<Vec<clustering::Token>> = Vec::with_capacity(articles.len());
+        let mut headlines = Vec::with_capacity(articles.len());
+        let mut tokenized_headlines = Vec::with_capacity(articles.len());
         let mut token_set: HashSet<String> = HashSet::new();
-        for (h, t, lang, _, snippet) in articles {
+        let cats: Vec<&str> = articles.iter().map(|(_, _, _, _, _, c)| c.as_str()).collect();
+
+        for (h, t, lang, _, snippet, _) in articles {
             let en = if lang == "en" { h.clone() } else if !t.is_empty() { t.clone() } else { h.clone() };
-            let text = cluster_text(&en, snippet);
+            // No URL available for already-stored articles, so skip slug for existing clusters
+            let text = if !snippet.is_empty() {
+                format!("{} . {}", en, snippet.trim())
+            } else {
+                en
+            };
             let tokens = clustering::tokenize_weighted(&text);
             for tok in &tokens {
                 token_set.insert(tok.word.clone());
@@ -102,47 +181,55 @@ fn process(
             tokenized_headlines.push(tokens);
             headlines.push(text);
         }
+
         cluster_data.insert(cid.clone(), clustering::ClusterData {
             headlines,
             tokenized_headlines,
             token_set,
             last_updated: last_updated.clone(),
+            category: Some(dominant_category(&cats)),
+            publisher_ids: pubs.iter().cloned().collect(),
         });
     }
 
     log::info!("{} existing clusters loaded for matching", cluster_data.len());
 
-    // Build IDF table from all existing cluster headlines.
-    // Refreshed when enough new vocabulary has accumulated since the last rebuild —
-    // a count-of-new-tokens threshold is more meaningful than a fixed cluster count.
     let mut idf = clustering::build_idf_table(&cluster_data);
     let mut new_vocab_since_refresh: usize = 0;
     const VOCAB_REFRESH_THRESHOLD: usize = 50;
 
-    // 3. Assign each new article to a cluster using TF-IDF cosine similarity.
-    // All writes are batched in a single transaction to avoid per-statement fsync overhead.
+    // 3. Greedy per-article cluster assignment.
     let mut clusters_created = 0;
 
     conn.execute_batch("BEGIN")?;
     let cluster_result: Result<()> = (|| {
         for article in &new_articles {
-            // Always use English headline for clustering consistency
             let headline = if article.language == "en" {
                 &article.original_headline
             } else if !article.translated_headline.is_empty() {
-                &article.translated_headline // MT->EN translation
+                &article.translated_headline
             } else {
-                &article.original_headline // MT original as last resort
+                &article.original_headline
             };
 
-            // Hybrid text: headline + snippet gives the model dense topic + context.
-            let text = cluster_text(headline, &article.body_snippet);
+            // Build cluster text: EN headline + snippet + URL slug (#4)
+            let mut text = cluster_text(headline, &article.body_snippet, &article.original_url);
+
+            // Append MT proper nouns alongside the English translation (#19)
+            if article.language != "en" {
+                let extras = mt_entity_words(&article.original_headline);
+                if !extras.is_empty() {
+                    text = format!("{} . {}", text, extras);
+                }
+            }
 
             let new_cluster_id = uuid::Uuid::new_v4().to_string();
 
             let assignment = clustering::assign_cluster(
                 &text,
                 &article.published_at,
+                &article.category,
+                &article.publisher_id,
                 &cluster_data,
                 &idf,
                 &new_cluster_id,
@@ -156,22 +243,25 @@ fn process(
 
                 let tokens = clustering::tokenize_weighted(&text);
                 let token_set: HashSet<String> = tokens.iter().map(|t| t.word.clone()).collect();
-                // Count tokens genuinely new to the IDF vocabulary and refresh if enough
-                // have accumulated. Done after building token_set so the rebuild includes
-                // this cluster's vocabulary.
                 new_vocab_since_refresh += token_set.iter().filter(|w| !idf.contains_key(w.as_str())).count();
+
+                let mut pub_set = HashSet::new();
+                pub_set.insert(article.publisher_id.clone());
+
                 cluster_data.insert(assignment.cluster_id.clone(), clustering::ClusterData {
                     headlines: vec![text.clone()],
                     tokenized_headlines: vec![tokens],
                     token_set,
                     last_updated: article.published_at.clone(),
+                    category: Some(article.category.clone()),
+                    publisher_ids: pub_set,
                 });
+
                 if new_vocab_since_refresh >= VOCAB_REFRESH_THRESHOLD {
                     idf = clustering::build_idf_table(&cluster_data);
                     new_vocab_since_refresh = 0;
                 }
 
-                // Track for blindspot pass so step 4 needs no second DB load.
                 pub_map.insert(assignment.cluster_id.clone(), (
                     article.published_at.clone(),
                     article.published_at.clone(),
@@ -183,6 +273,7 @@ fn process(
                     article.language.clone(),
                     article.publisher_id.clone(),
                     article.body_snippet.clone(),
+                    article.category.clone(),
                 ));
 
                 db::upsert_cluster(
@@ -196,8 +287,6 @@ fn process(
             } else {
                 log::info!("Joined cluster: {} -> {}", headline, &assignment.cluster_id);
 
-                // Keep the in-memory data up to date so subsequent articles in this batch
-                // can also match against this new variant.
                 if let Some(data) = cluster_data.get_mut(&assignment.cluster_id) {
                     let tokens = clustering::tokenize_weighted(&text);
                     for t in &tokens {
@@ -208,9 +297,15 @@ fn process(
                     if article.published_at > data.last_updated {
                         data.last_updated = article.published_at.clone();
                     }
+                    data.publisher_ids.insert(article.publisher_id.clone());
+                    // Update dominant category if needed
+                    let cats: Vec<&str> = article_data
+                        .get(&assignment.cluster_id)
+                        .map(|v| v.iter().map(|(_, _, _, _, _, c)| c.as_str()).collect())
+                        .unwrap_or_default();
+                    data.category = Some(dominant_category(&cats));
                 }
 
-                // Track for blindspot pass so step 4 needs no second DB load.
                 if let Some((_, last, pubs)) = pub_map.get_mut(&assignment.cluster_id) {
                     if article.published_at > *last {
                         *last = article.published_at.clone();
@@ -225,6 +320,7 @@ fn process(
                     article.language.clone(),
                     article.publisher_id.clone(),
                     article.body_snippet.clone(),
+                    article.category.clone(),
                 ));
 
                 db::upsert_cluster(
@@ -245,10 +341,39 @@ fn process(
     }
 
     drop(new_articles);
+
+    // 4. Second-pass cluster-to-cluster merge (#7)
+    let merges = clustering::find_cluster_merges(&cluster_data, &idf);
+    if !merges.is_empty() {
+        log::info!("Second-pass merge: {} cluster pairs", merges.len());
+        conn.execute_batch("BEGIN")?;
+        let merge_result: Result<()> = (|| {
+            for (from_id, to_id) in &merges {
+                db::merge_cluster_articles(&conn, from_id, to_id)?;
+                // Merge in-memory pub_map and article_data for the blindspot pass
+                if let Some((from_first, from_last, from_pubs)) = pub_map.remove(from_id) {
+                    if let Some((_, to_last, to_pubs)) = pub_map.get_mut(to_id) {
+                        if from_last > *to_last { *to_last = from_last; }
+                        for p in from_pubs { if !to_pubs.contains(&p) { to_pubs.push(p); } }
+                    } else {
+                        pub_map.insert(to_id.clone(), (from_first, from_last, from_pubs));
+                    }
+                }
+                if let Some(from_articles) = article_data.remove(from_id) {
+                    article_data.entry(to_id.clone()).or_default().extend(from_articles);
+                }
+            }
+            Ok(())
+        })();
+        match merge_result {
+            Ok(()) => conn.execute_batch("COMMIT")?,
+            Err(e) => { let _ = conn.execute_batch("ROLLBACK"); log::warn!("merge pass failed: {}", e); }
+        }
+    }
+
     drop(cluster_data);
 
-    // 4. Blindspot analysis + best headline selection.
-    // pub_map and article_data were built in step 2 and augmented in step 3 — no second DB load needed.
+    // 5. Blindspot analysis + best headline selection.
     let empty_vec = Vec::new();
     conn.execute_batch("BEGIN")?;
     let blindspot_result: Result<()> = (|| {
@@ -272,13 +397,11 @@ fn process(
         articles_scraped: scraped_count,
         articles_new: new_count,
         clusters_created,
-        failed_sources: Vec::new(), // populated by run()
+        failed_sources: Vec::new(),
     })
 }
 
 /// Re-cluster every article already in the database without re-scraping.
-/// Wipes all existing cluster assignments and rebuilds them from scratch using
-/// the current TF-IDF algorithm in chronological order.
 pub fn recluster_all(db: &Pool<SqliteConnectionManager>) -> Result<PipelineResult> {
     let conn = db.get()?;
 
@@ -289,11 +412,8 @@ pub fn recluster_all(db: &Pool<SqliteConnectionManager>) -> Result<PipelineResul
     log::info!("{} articles to re-cluster", articles.len());
 
     let mut cluster_data: HashMap<String, clustering::ClusterData> = HashMap::new();
-    // Track per-cluster pub and headline data in memory for the blindspot pass.
-    // recluster_all starts from a wiped state so both maps begin empty.
-    // pub_map: cluster_id → (first_reported, last_updated, publisher_ids)
     let mut pub_map: HashMap<String, (String, String, Vec<String>)> = HashMap::new();
-    let mut article_data: HashMap<String, Vec<(String, String, String, String, String)>> = HashMap::new();
+    let mut article_data: HashMap<String, Vec<(String, String, String, String, String, String)>> = HashMap::new();
     let mut idf = clustering::build_idf_table(&cluster_data);
     let mut new_vocab_since_refresh: usize = 0;
     const VOCAB_REFRESH_THRESHOLD: usize = 50;
@@ -301,7 +421,7 @@ pub fn recluster_all(db: &Pool<SqliteConnectionManager>) -> Result<PipelineResul
 
     conn.execute_batch("BEGIN")?;
     let recluster_result: Result<()> = (|| {
-        for (article_id, original_headline, translated_headline, language, published_at, snippet, publisher_id) in &articles {
+        for (article_id, original_headline, translated_headline, language, published_at, snippet, publisher_id, category, original_url) in &articles {
             let headline = if language == "en" {
                 original_headline
             } else if !translated_headline.is_empty() {
@@ -310,12 +430,20 @@ pub fn recluster_all(db: &Pool<SqliteConnectionManager>) -> Result<PipelineResul
                 original_headline
             };
 
-            let text = cluster_text(headline, snippet);
+            let mut text = cluster_text(headline, snippet, original_url);
+            if language != "en" {
+                let extras = mt_entity_words(original_headline);
+                if !extras.is_empty() {
+                    text = format!("{} . {}", text, extras);
+                }
+            }
 
             let new_cluster_id = uuid::Uuid::new_v4().to_string();
             let assignment = clustering::assign_cluster(
                 &text,
                 published_at,
+                category,
+                publisher_id,
                 &cluster_data,
                 &idf,
                 &new_cluster_id,
@@ -328,16 +456,24 @@ pub fn recluster_all(db: &Pool<SqliteConnectionManager>) -> Result<PipelineResul
                 let tokens = clustering::tokenize_weighted(&text);
                 let token_set: HashSet<String> = tokens.iter().map(|t| t.word.clone()).collect();
                 new_vocab_since_refresh += token_set.iter().filter(|w| !idf.contains_key(w.as_str())).count();
+
+                let mut pub_set = HashSet::new();
+                pub_set.insert(publisher_id.clone());
+
                 cluster_data.insert(assignment.cluster_id.clone(), clustering::ClusterData {
                     headlines: vec![text.clone()],
                     tokenized_headlines: vec![tokens],
                     token_set,
                     last_updated: published_at.clone(),
+                    category: Some(category.clone()),
+                    publisher_ids: pub_set,
                 });
+
                 if new_vocab_since_refresh >= VOCAB_REFRESH_THRESHOLD {
                     idf = clustering::build_idf_table(&cluster_data);
                     new_vocab_since_refresh = 0;
                 }
+
                 pub_map.insert(assignment.cluster_id.clone(), (
                     published_at.clone(),
                     published_at.clone(),
@@ -349,27 +485,21 @@ pub fn recluster_all(db: &Pool<SqliteConnectionManager>) -> Result<PipelineResul
                     language.clone(),
                     publisher_id.clone(),
                     snippet.clone(),
+                    category.clone(),
                 ));
                 db::upsert_cluster(&conn, &assignment.cluster_id, headline, published_at, published_at, false)?;
             } else {
                 if let Some(data) = cluster_data.get_mut(&assignment.cluster_id) {
                     let tokens = clustering::tokenize_weighted(&text);
-                    for t in &tokens {
-                        data.token_set.insert(t.word.clone());
-                    }
+                    for t in &tokens { data.token_set.insert(t.word.clone()); }
                     data.tokenized_headlines.push(tokens);
                     data.headlines.push(text);
-                    if published_at > &data.last_updated {
-                        data.last_updated = published_at.clone();
-                    }
+                    if published_at > &data.last_updated { data.last_updated = published_at.clone(); }
+                    data.publisher_ids.insert(publisher_id.clone());
                 }
                 if let Some((_, last, pubs)) = pub_map.get_mut(&assignment.cluster_id) {
-                    if published_at > last {
-                        *last = published_at.clone();
-                    }
-                    if !pubs.contains(publisher_id) {
-                        pubs.push(publisher_id.clone());
-                    }
+                    if published_at > last { *last = published_at.clone(); }
+                    if !pubs.contains(publisher_id) { pubs.push(publisher_id.clone()); }
                 }
                 article_data.entry(assignment.cluster_id.clone()).or_default().push((
                     original_headline.clone(),
@@ -377,6 +507,7 @@ pub fn recluster_all(db: &Pool<SqliteConnectionManager>) -> Result<PipelineResul
                     language.clone(),
                     publisher_id.clone(),
                     snippet.clone(),
+                    category.clone(),
                 ));
                 db::upsert_cluster(&conn, &assignment.cluster_id, headline, published_at, published_at, false)?;
             }
@@ -388,8 +519,36 @@ pub fn recluster_all(db: &Pool<SqliteConnectionManager>) -> Result<PipelineResul
         Err(e) => { let _ = conn.execute_batch("ROLLBACK"); return Err(e); }
     }
 
-    // Blindspot analysis + best headline for all clusters.
-    // pub_map and article_data were built in the clustering loop — no second DB load needed.
+    // Second-pass merge for recluster
+    let merges = clustering::find_cluster_merges(&cluster_data, &idf);
+    if !merges.is_empty() {
+        log::info!("Recluster second-pass merge: {} pairs", merges.len());
+        conn.execute_batch("BEGIN")?;
+        let merge_result: Result<()> = (|| {
+            for (from_id, to_id) in &merges {
+                db::merge_cluster_articles(&conn, from_id, to_id)?;
+                if let Some((from_first, from_last, from_pubs)) = pub_map.remove(from_id) {
+                    if let Some((_, to_last, to_pubs)) = pub_map.get_mut(to_id) {
+                        if from_last > *to_last { *to_last = from_last; }
+                        for p in from_pubs { if !to_pubs.contains(&p) { to_pubs.push(p); } }
+                    } else {
+                        pub_map.insert(to_id.clone(), (from_first, from_last, from_pubs));
+                    }
+                }
+                if let Some(from_articles) = article_data.remove(from_id) {
+                    article_data.entry(to_id.clone()).or_default().extend(from_articles);
+                }
+            }
+            Ok(())
+        })();
+        match merge_result {
+            Ok(()) => conn.execute_batch("COMMIT")?,
+            Err(e) => { let _ = conn.execute_batch("ROLLBACK"); log::warn!("recluster merge pass failed: {}", e); }
+        }
+    }
+
+    drop(cluster_data);
+
     let empty_vec = Vec::new();
     conn.execute_batch("BEGIN")?;
     let blindspot_result: Result<()> = (|| {
@@ -429,7 +588,6 @@ pub async fn run(db: &Pool<SqliteConnectionManager>) -> Result<PipelineResult> {
     let (mut raw_articles, failed_sources) = scraper::scrape_all(&custom_pubs).await;
     log::info!("scraped {} articles total", raw_articles.len());
 
-    // Mark already-stored articles so translate_headlines skips them
     {
         let conn = db.get()?;
         let ids: Vec<&str> = raw_articles.iter().map(|a| a.id.as_str()).collect();
@@ -447,18 +605,15 @@ pub async fn run(db: &Pool<SqliteConnectionManager>) -> Result<PipelineResult> {
     translate::translate_headlines(&mut raw_articles).await;
 
     for a in &mut raw_articles {
-        // Only fall back to original for EN articles — MT articles with no translation
-        // keep translated_headline empty so the UI can show the Maltese original correctly.
         if a.translated_headline.is_empty() && a.language == "en" {
             a.translated_headline = a.original_headline.clone();
         }
-        // Classify using URL + English headline
         let en_headline = if a.language == "en" {
             &a.original_headline
         } else if !a.translated_headline.is_empty() {
-            &a.translated_headline // MT->EN translation
+            &a.translated_headline
         } else {
-            &a.original_headline // MT original as fallback for classification
+            &a.original_headline
         };
         a.category = category::classify(&a.original_url, en_headline).to_string();
     }

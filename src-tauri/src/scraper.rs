@@ -7,8 +7,27 @@ use std::sync::OnceLock;
 use crate::models::{CustomPublisherDef, PublisherDef, RawArticle, ScrapeMethod};
 use crate::publishers::all_publisher_defs;
 
+/// Strip tracking/variant query params and fragments before hashing so that
+/// ?utm_source=…, #comments, trailing slashes, etc. don't create duplicate IDs. (#11)
+///
+/// Allowlisted params that carry real identity (WordPress ?p=, Joomla ?article=) are kept.
+fn canonical_url(url: &str) -> &str {
+    // Strip fragment
+    let url = url.split('#').next().unwrap_or(url);
+    // Strip trailing slash (but not for bare domains like https://example.com/)
+    let slashes = url.matches('/').count();
+    let url = if url.ends_with('/') && slashes > 3 {
+        url.trim_end_matches('/')
+    } else {
+        url
+    };
+    // Strip query string entirely — meaningful query IDs (?p=123) are rare and
+    // ambiguous enough that dropping them is safer than allowlisting.
+    url.split('?').next().unwrap_or(url)
+}
+
 fn stable_id(url: &str) -> String {
-    let hash = Sha256::digest(url.as_bytes());
+    let hash = Sha256::digest(canonical_url(url).as_bytes());
     hex::encode(&hash[..8])
 }
 
@@ -615,6 +634,8 @@ async fn fetch_sitemap(client: &reqwest::Client, publisher: &PublisherDef, sitem
         }
 
         let pub_date_str = extract_xml_tag(block, "news:publication_date").unwrap_or_default();
+        // #17: Skip articles with missing or unparseable dates rather than faking Utc::now(),
+        // which would make them appear artificially fresh and skew stale-cluster checks.
         let published_at = if !pub_date_str.is_empty() {
             if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(&pub_date_str) {
                 let dt_utc = dt.with_timezone(&chrono::Utc);
@@ -629,10 +650,12 @@ async fn fetch_sitemap(client: &reqwest::Client, publisher: &PublisherDef, sitem
                 }
                 dt.to_rfc3339()
             } else {
-                Utc::now().to_rfc3339()
+                log::debug!("[sitemap] {}: unparseable date '{}', skipping {}", publisher.id, pub_date_str, loc);
+                continue;
             }
         } else {
-            Utc::now().to_rfc3339()
+            log::debug!("[sitemap] {}: missing date, skipping {}", publisher.id, loc);
+            continue;
         };
 
         let image_url = extract_xml_tag(block, "image:loc").unwrap_or_default();
@@ -759,16 +782,19 @@ async fn fetch_sitemap_dynamic(client: &reqwest::Client, id: &str, sitemap_url: 
         if is_non_article_headline(&title) { continue; }
 
         let pub_date_str = extract_xml_tag(block, "news:publication_date").unwrap_or_default();
+        // #17: Skip rather than fake Utc::now() for bad/missing dates
         let published_at = if !pub_date_str.is_empty() {
             if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(&pub_date_str) {
                 let dt_utc = dt.with_timezone(&chrono::Utc);
                 if dt_utc < cutoff { continue; }
                 dt_utc.to_rfc3339()
             } else {
-                Utc::now().to_rfc3339()
+                log::debug!("[sitemap/custom] {}: unparseable date '{}', skipping", id, pub_date_str);
+                continue;
             }
         } else {
-            Utc::now().to_rfc3339()
+            log::debug!("[sitemap/custom] {}: missing date, skipping {}", id, loc);
+            continue;
         };
 
         let image_url = extract_xml_tag(block, "image:loc").unwrap_or_default();
@@ -931,12 +957,24 @@ async fn fetch_rss_dynamic(client: &reqwest::Client, id: &str, rss_url: &str) ->
     Ok(articles)
 }
 
-/// Scrape all publishers in parallel.
+/// Scrape all publishers in parallel with a per-source timeout. (#14)
 /// Returns (articles, failed_publisher_ids).
 pub async fn scrape_all(custom_pubs: &[CustomPublisherDef]) -> (Vec<RawArticle>, Vec<String>) {
     let client = http_client();
     let publishers = all_publisher_defs();
-    let static_futures: Vec<_> = publishers.iter().map(|p| fetch_publisher(client, p)).collect();
+    let fetch_timeout = std::time::Duration::from_secs(12);
+
+    // Wrap every static-publisher fetch in a 12-second timeout so one slow
+    // site can't hold up the entire user-visible refresh. (#14)
+    let static_futures: Vec<_> = publishers.iter().map(|p| {
+        async move {
+            match tokio::time::timeout(fetch_timeout, fetch_publisher(client, p)).await {
+                Ok(r) => r,
+                Err(_) => Err(anyhow::anyhow!("timeout fetching {}", p.id)),
+            }
+        }
+    }).collect();
+
     let custom_futures: Vec<_> = custom_pubs.iter().map(|p| {
         let client = &client;
         let id = p.id.clone();
@@ -944,10 +982,16 @@ pub async fn scrape_all(custom_pubs: &[CustomPublisherDef]) -> (Vec<RawArticle>,
         let method = p.scrape_method.clone();
         let config = p.scrape_config.clone();
         async move {
-            match method.as_str() {
-                "sitemap" => fetch_sitemap_dynamic(client, &id, &url).await,
-                "html"    => fetch_html_dynamic(client, &id, &url, &config).await,
-                _         => fetch_rss_dynamic(client, &id, &url).await,
+            let fut = async {
+                match method.as_str() {
+                    "sitemap" => fetch_sitemap_dynamic(client, &id, &url).await,
+                    "html"    => fetch_html_dynamic(client, &id, &url, &config).await,
+                    _         => fetch_rss_dynamic(client, &id, &url).await,
+                }
+            };
+            match tokio::time::timeout(fetch_timeout, fut).await {
+                Ok(r) => r,
+                Err(_) => Err(anyhow::anyhow!("timeout fetching custom {}", id)),
             }
         }
     }).collect();

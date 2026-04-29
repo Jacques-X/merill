@@ -430,12 +430,12 @@ pub fn wipe_all_data(conn: &Connection) -> Result<()> {
 }
 
 /// Load every article in chronological order for re-clustering.
-/// Returns (id, original_headline, translated_headline, language, published_at, snippet, publisher_id).
+/// Returns (id, original_headline, translated_headline, language, published_at, snippet, publisher_id, category, original_url).
 pub fn load_articles_for_recluster(
     conn: &Connection,
-) -> Result<Vec<(String, String, String, String, String, String, String)>> {
+) -> Result<Vec<(String, String, String, String, String, String, String, String, String)>> {
     let mut stmt = conn.prepare(
-        "SELECT id, headline, translated_headline, language, published_at, snippet, publisher_id
+        "SELECT id, headline, translated_headline, language, published_at, snippet, publisher_id, category, original_url
          FROM articles
          ORDER BY published_at ASC",
     )?;
@@ -449,6 +449,8 @@ pub fn load_articles_for_recluster(
                 row.get::<_, String>(4)?,
                 row.get::<_, String>(5).unwrap_or_default(),
                 row.get::<_, String>(6).unwrap_or_default(),
+                row.get::<_, String>(7).unwrap_or_else(|_| "general".to_string()),
+                row.get::<_, String>(8).unwrap_or_default(),
             ))
         })?
         .collect::<Result<Vec<_>, _>>()?;
@@ -478,16 +480,16 @@ pub fn get_cluster_headlines(
 }
 
 /// Load headlines + snippets for ALL clusters in a single query, grouped by cluster_id.
-/// Returns (headline, translated_headline, language, publisher_id, snippet).
+/// Returns (headline, translated_headline, language, publisher_id, snippet, category).
 /// Avoids N+1 queries during blindspot analysis and cluster-data building.
 pub fn load_all_cluster_headlines(
     conn: &Connection,
-) -> Result<std::collections::HashMap<String, Vec<(String, String, String, String, String)>>> {
+) -> Result<std::collections::HashMap<String, Vec<(String, String, String, String, String, String)>>> {
     let mut stmt = conn.prepare(
-        "SELECT cluster_id, headline, translated_headline, language, publisher_id, snippet
+        "SELECT cluster_id, headline, translated_headline, language, publisher_id, snippet, category
          FROM articles WHERE cluster_id IS NOT NULL",
     )?;
-    let mut result: std::collections::HashMap<String, Vec<(String, String, String, String, String)>> =
+    let mut result: std::collections::HashMap<String, Vec<(String, String, String, String, String, String)>> =
         std::collections::HashMap::new();
     let rows = stmt.query_map([], |row| {
         Ok((
@@ -497,14 +499,26 @@ pub fn load_all_cluster_headlines(
             row.get::<_, String>(3)?,
             row.get::<_, String>(4)?,
             row.get::<_, String>(5).unwrap_or_default(),
+            row.get::<_, String>(6).unwrap_or_else(|_| "general".to_string()),
         ))
     })?;
     for row in rows {
-        let (cluster_id, headline, translated, language, publisher_id, snippet) = row?;
+        let (cluster_id, headline, translated, language, publisher_id, snippet, category) = row?;
         result
             .entry(cluster_id)
             .or_default()
-            .push((headline, translated, language, publisher_id, snippet));
+            .push((headline, translated, language, publisher_id, snippet, category));
     }
     Ok(result)
+}
+
+/// Move all articles from one cluster into another, then delete the source cluster row.
+/// Used by the second-pass cluster-to-cluster merge.
+pub fn merge_cluster_articles(conn: &Connection, from_id: &str, to_id: &str) -> Result<()> {
+    conn.execute(
+        "UPDATE articles SET cluster_id = ?1 WHERE cluster_id = ?2",
+        params![to_id, from_id],
+    )?;
+    conn.execute("DELETE FROM clusters WHERE id = ?1", params![from_id])?;
+    Ok(())
 }
