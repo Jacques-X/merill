@@ -1,4 +1,17 @@
 use anyhow::{Context, Result};
+use std::sync::OnceLock;
+
+static HTTP_CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
+
+fn http_client() -> &'static reqwest::Client {
+    HTTP_CLIENT.get_or_init(|| {
+        reqwest::Client::builder()
+            .user_agent("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15")
+            .timeout(std::time::Duration::from_secs(10))
+            .build()
+            .expect("failed to build HTTP client")
+    })
+}
 
 use crate::models::RawArticle;
 
@@ -93,11 +106,7 @@ async fn translate_tasks(
 /// Translate all article headlines to the other language.
 /// MT→EN and EN→MT run concurrently. Articles with a non-empty translated_headline are skipped.
 pub async fn translate_headlines(articles: &mut [RawArticle]) {
-    let client = reqwest::Client::builder()
-        .user_agent("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15")
-        .timeout(std::time::Duration::from_secs(10))
-        .build()
-        .unwrap();
+    let client = http_client();
 
     // Snapshot (index, headline) pairs — releases immutable borrow before we write results back
     let mt_tasks: Vec<(usize, String)> = articles

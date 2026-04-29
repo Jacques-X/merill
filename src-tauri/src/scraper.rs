@@ -2,6 +2,7 @@ use anyhow::{Context, Result};
 use chrono::{Duration, Utc};
 use scraper::{Html, Selector};
 use sha2::{Digest, Sha256};
+use std::sync::OnceLock;
 
 use crate::models::{CustomPublisherDef, PublisherDef, RawArticle, ScrapeMethod};
 use crate::publishers::all_publisher_defs;
@@ -109,6 +110,54 @@ fn extract_image_url(html: &str) -> Option<String> {
     None
 }
 
+// ── Static CSS selectors ────────────────────────────────────────────────────
+// Compiled once at first use — Selector::parse is non-trivial so paying it per
+// call to extract_body_text / auto_detect_article_sel is unnecessary work.
+
+fn container_selectors() -> &'static [Selector] {
+    static SELS: OnceLock<Vec<Selector>> = OnceLock::new();
+    SELS.get_or_init(|| {
+        [
+            "article",
+            ".article-body",
+            ".article-content",
+            ".entry-content",
+            ".post-content",
+            ".story-body",
+            "[itemprop=\"articleBody\"]",
+        ]
+        .iter()
+        .filter_map(|s| Selector::parse(s).ok())
+        .collect()
+    })
+}
+
+fn paragraph_selector() -> &'static Selector {
+    static SEL: OnceLock<Selector> = OnceLock::new();
+    SEL.get_or_init(|| Selector::parse("p").unwrap())
+}
+
+fn article_candidate_selectors() -> &'static Vec<(&'static str, Selector)> {
+    static SELS: OnceLock<Vec<(&'static str, Selector)>> = OnceLock::new();
+    SELS.get_or_init(|| {
+        [
+            "article a[href]",
+            "h2 a[href]",
+            "h3 a[href]",
+            "h1 a[href]",
+            ".entry-title a[href]",
+            ".post-title a[href]",
+            ".article-title a[href]",
+            ".news-title a[href]",
+            "[class*='headline'] a[href]",
+            "[class*='title'] a[href]",
+        ]
+        .iter()
+        .filter_map(|s| Selector::parse(s).ok().map(|sel| (*s, sel)))
+        .collect()
+    })
+}
+
 /// Extract content attribute value from a meta tag string.
 fn extract_meta_content<'a>(tag: &'a str, original_tag: &'a str) -> Option<&'a str> {
     // Try quoted: content="..." or content='...'
@@ -135,62 +184,67 @@ fn extract_meta_content<'a>(tag: &'a str, original_tag: &'a str) -> Option<&'a s
 
 /// Extract image URL from meta tags (og:image, twitter:image, etc).
 pub fn extract_meta_image(html: &str) -> Option<String> {
-    // Normalize whitespace so <meta\nproperty=...> becomes <meta property=...>
-    // Only normalize within the head section (first 100KB) to avoid huge allocations.
-    let normalized = html
-        .chars()
-        .map(|c| if c == '\n' || c == '\r' || c == '\t' { ' ' } else { c })
-        .collect::<String>();
-    let lower = normalized.to_lowercase();
-    let mut search_from = 0;
-
     let mut og_image: Option<String> = None;
     let mut twitter_image: Option<String> = None;
+    let mut search_from = 0;
 
-    while let Some(meta_pos) = lower[search_from..].find("<meta ") {
-        let abs_pos = search_from + meta_pos;
-        let tag_end = match lower[abs_pos..].find('>') {
+    while search_from < html.len() {
+        // Find the next <meta tag — normalise whitespace only within the tag itself,
+        // not the full document, to avoid a large allocation per article body fetch.
+        let rest = &html[search_from..];
+        let meta_pos = rest.find("<meta").or_else(|| rest.find("<META"));
+        let Some(rel_pos) = meta_pos else { break };
+        let abs_pos = search_from + rel_pos;
+        let tag_end = match html[abs_pos..].find('>') {
             Some(e) => abs_pos + e + 1,
             None => break,
         };
-        let tag = &lower[abs_pos..tag_end];
-        let original_tag = &normalized[abs_pos..tag_end];
 
-        // og:image (but not og:image:width, og:image:height, etc.)
-        if og_image.is_none()
-            && tag.contains("og:image")
-            && !tag.contains("og:image:")
-        {
-            if let Some(url) = extract_meta_content(tag, original_tag) {
+        let tag_orig = &html[abs_pos..tag_end];
+        // Normalise only this one tag (handles <meta\n property=...> forms).
+        let tag_norm: String = tag_orig
+            .chars()
+            .map(|c| if c == '\n' || c == '\r' || c == '\t' { ' ' } else { c })
+            .collect();
+        let tag = tag_norm.to_lowercase();
+
+        if og_image.is_none() && tag.contains("og:image") && !tag.contains("og:image:") {
+            if let Some(url) = extract_meta_content(&tag, &tag_norm) {
                 if url.starts_with("http") && is_good_image(url) {
                     og_image = Some(url.to_string());
                 }
             }
         }
 
-        // twitter:image or twitter:image:src
         if twitter_image.is_none()
             && (tag.contains("twitter:image:src") || tag.contains("twitter:image"))
         {
-            if let Some(url) = extract_meta_content(tag, original_tag) {
+            if let Some(url) = extract_meta_content(&tag, &tag_norm) {
                 if url.starts_with("http") && is_good_image(url) {
                     twitter_image = Some(url.to_string());
                 }
             }
         }
 
+        if og_image.is_some() && twitter_image.is_some() {
+            break;
+        }
         search_from = tag_end;
     }
 
     og_image.or(twitter_image)
 }
 
-fn build_client() -> reqwest::Client {
-    reqwest::Client::builder()
-        .user_agent("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.0 Safari/605.1.15")
-        .timeout(std::time::Duration::from_secs(8))
-        .build()
-        .expect("failed to build HTTP client")
+static HTTP_CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
+
+fn http_client() -> &'static reqwest::Client {
+    HTTP_CLIENT.get_or_init(|| {
+        reqwest::Client::builder()
+            .user_agent("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.0 Safari/605.1.15")
+            .timeout(std::time::Duration::from_secs(8))
+            .build()
+            .expect("failed to build HTTP client")
+    })
 }
 
 // ── RSS image extraction ─────────────────────────────────────────────────────
@@ -501,49 +555,30 @@ fn is_nav_link(url: &str) -> bool {
 
 /// Extract article body text from an HTML page by pulling <p> content.
 pub fn extract_body_text(html: &str) -> String {
-    // Parse with the scraper crate — drop before any await.
     let document = Html::parse_document(html);
+    let p_sel = paragraph_selector();
 
-    // Try <article> first, then common body selectors, then fall back to all <p>.
-    let containers = [
-        "article",
-        ".article-body",
-        ".article-content",
-        ".entry-content",
-        ".post-content",
-        ".story-body",
-        "[itemprop=\"articleBody\"]",
-    ];
-
-    let p_sel = Selector::parse("p").unwrap();
-
-    for container_sel_str in &containers {
-        if let Ok(sel) = Selector::parse(container_sel_str) {
-            if let Some(container) = document.select(&sel).next() {
-                let paragraphs: Vec<String> = container
-                    .select(&p_sel)
-                    .map(|p| p.text().collect::<Vec<_>>().join(" ").trim().to_string())
-                    .filter(|t| t.len() > 30) // skip tiny paragraphs (captions, etc.)
-                    .collect();
-                if paragraphs.len() >= 2 {
-                    return paragraphs.join("\n\n");
-                }
+    for sel in container_selectors() {
+        if let Some(container) = document.select(sel).next() {
+            let paragraphs: Vec<String> = container
+                .select(p_sel)
+                .map(|p| p.text().collect::<Vec<_>>().join(" ").trim().to_string())
+                .filter(|t| t.len() > 30)
+                .collect();
+            if paragraphs.len() >= 2 {
+                return paragraphs.join("\n\n");
             }
         }
     }
 
     // Fallback: all <p> tags in the document with decent length.
     let paragraphs: Vec<String> = document
-        .select(&p_sel)
+        .select(p_sel)
         .map(|p| p.text().collect::<Vec<_>>().join(" ").trim().to_string())
         .filter(|t| t.len() > 40)
         .collect();
 
-    if paragraphs.len() >= 2 {
-        paragraphs.join("\n\n")
-    } else {
-        String::new()
-    }
+    if paragraphs.len() >= 2 { paragraphs.join("\n\n") } else { String::new() }
 }
 
 async fn fetch_sitemap(client: &reqwest::Client, publisher: &PublisherDef, sitemap_url: &str) -> Result<Vec<RawArticle>> {
@@ -677,40 +712,24 @@ async fn fetch_publisher(client: &reqwest::Client, publisher: &PublisherDef) -> 
 /// Auto-detect the best article CSS selector for a news homepage.
 /// Tries common patterns and returns the one that yields the most valid article links.
 pub fn auto_detect_article_sel(html: &str) -> Option<String> {
-    let candidates = [
-        "article a[href]",
-        "h2 a[href]",
-        "h3 a[href]",
-        "h1 a[href]",
-        ".entry-title a[href]",
-        ".post-title a[href]",
-        ".article-title a[href]",
-        ".news-title a[href]",
-        "[class*='headline'] a[href]",
-        "[class*='title'] a[href]",
-    ];
-
     let document = Html::parse_document(html);
-    let mut best: Option<(String, usize)> = None;
+    let mut best: Option<(&str, usize)> = None;
 
-    for sel_str in &candidates {
-        let Ok(sel) = Selector::parse(sel_str) else { continue };
+    for (sel_str, sel) in article_candidate_selectors() {
         let count = document
-            .select(&sel)
+            .select(sel)
             .filter(|el| {
                 let href = el.value().attr("href").unwrap_or("");
                 let text: String = el.text().collect::<Vec<_>>().join(" ");
                 !href.is_empty() && !is_nav_link(href) && text.trim().len() >= 10
             })
             .count();
-        if count >= 2 {
-            if best.as_ref().map_or(true, |(_, c)| count > *c) {
-                best = Some((sel_str.to_string(), count));
-            }
+        if count >= 2 && best.as_ref().map_or(true, |(_, c)| count > *c) {
+            best = Some((sel_str, count));
         }
     }
 
-    best.map(|(sel, _)| sel)
+    best.map(|(s, _)| s.to_string())
 }
 
 /// Scrape a user-added sitemap feed.
@@ -915,9 +934,9 @@ async fn fetch_rss_dynamic(client: &reqwest::Client, id: &str, rss_url: &str) ->
 /// Scrape all publishers in parallel.
 /// Returns (articles, failed_publisher_ids).
 pub async fn scrape_all(custom_pubs: &[CustomPublisherDef]) -> (Vec<RawArticle>, Vec<String>) {
-    let client = build_client();
+    let client = http_client();
     let publishers = all_publisher_defs();
-    let static_futures: Vec<_> = publishers.iter().map(|p| fetch_publisher(&client, p)).collect();
+    let static_futures: Vec<_> = publishers.iter().map(|p| fetch_publisher(client, p)).collect();
     let custom_futures: Vec<_> = custom_pubs.iter().map(|p| {
         let client = &client;
         let id = p.id.clone();

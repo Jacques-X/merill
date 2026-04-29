@@ -16,7 +16,7 @@ export function useClusters() {
   return useQuery({
     queryKey: clusterKeys.list({}),
     queryFn: fetchClusters,
-    staleTime: 1000 * 60 * 2,
+    staleTime: 1000 * 60 * 15,   // match refetchInterval so background refetches don't re-render
     refetchInterval: 1000 * 60 * 15,
   });
 }
@@ -47,6 +47,10 @@ export async function splitCluster(articleId: string, headline: string, publishe
 
 export async function forceRecluster(): Promise<string> {
   return invoke<string>("force_recluster");
+}
+
+export async function wipeAllData(): Promise<void> {
+  return invoke<void>("wipe_all_data");
 }
 
 export function useRefreshFeed() {

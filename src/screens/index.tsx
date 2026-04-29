@@ -2,7 +2,7 @@ import { useState, useEffect, useCallback, useRef, useMemo } from "react";
 import { useQueryClient } from "@tanstack/react-query";
 import { formatDistanceToNow } from "date-fns";
 import { invoke } from "@tauri-apps/api/core";
-import { useClusters, usePublishers, refreshFeed, addCustomPublisher, removeCustomPublisher, splitCluster, forceRecluster, clusterKeys } from "@/api/clusters";
+import { useClusters, usePublishers, refreshFeed, addCustomPublisher, removeCustomPublisher, splitCluster, forceRecluster, wipeAllData, clusterKeys } from "@/api/clusters";
 import { StoryCard } from "@/components/StoryCard/StoryCard";
 import { BiasBar } from "@/components/BiasBar/BiasBar";
 import { computeBiasCoverage } from "@/utils/bias";
@@ -215,16 +215,19 @@ function combineSummary(bodyTexts: string[]): string {
   const getWords = (s: string) =>
     new Set(s.toLowerCase().replace(/[^a-z\s]/g, "").split(/\s+/).filter(w => w.length > 3));
   const picked: string[] = [];
+  const pickedWords: Set<string>[] = []; // cache word sets so getWords isn't called O(n²)
   for (const sent of allSentences) {
     const sentWords = getWords(sent);
     if (sentWords.size < 2) continue;
-    const isDup = picked.some(existing => {
-      const ew = getWords(existing);
+    const isDup = pickedWords.some(ew => {
       const shared = [...sentWords].filter(w => ew.has(w)).length;
       const smaller = Math.min(sentWords.size, ew.size);
       return smaller > 0 && shared / smaller > 0.5;
     });
-    if (!isDup) picked.push(sent);
+    if (!isDup) {
+      picked.push(sent);
+      pickedWords.push(sentWords);
+    }
     if (picked.length >= 5) break;
   }
 
@@ -282,18 +285,15 @@ export function StoryDetailScreen({
     setSummaryLoading(true);
 
     async function fetchAll() {
-      const promises = cluster.articles.map(async (a) => {
-        try {
-          const r = await invoke<{ body_text: string; image_url: string }>("fetch_article_body", {
-            articleId: a.id,
-            url: a.original_url,
-          });
-          return { id: a.id, text: r.body_text };
-        } catch {
-          return { id: a.id, text: "" };
-        }
-      });
-      const all = await Promise.all(promises);
+      const promises = cluster.articles.map((a) =>
+        invoke<{ body_text: string; image_url: string }>("fetch_article_body", {
+          articleId: a.id,
+          url: a.original_url,
+        }).then(r => ({ id: a.id, text: r.body_text }))
+          .catch(() => ({ id: a.id, text: "" }))
+      );
+      const settled = await Promise.allSettled(promises);
+      const all = settled.map(r => r.status === "fulfilled" ? r.value : { id: "", text: "" }).filter(r => r.id);
       if (cancelled) return;
       const results = new Map<string, string>();
       for (const { id, text } of all) {
@@ -985,6 +985,8 @@ export function SettingsScreen() {
     isLocalPublisherEnabled, isGlobalPublisherEnabled } = useAppStore();
   const queryClient = useQueryClient();
   const [reclustering, setReclustering] = useState(false);
+  const [wiping, setWiping] = useState(false);
+  const [wipeConfirm, setWipeConfirm] = useState(false);
   const { data: publishers = [] } = usePublishers();
 
   const localPublishers = publishers.filter(p => !p.is_global).sort((a, b) => a.name.localeCompare(b.name));
@@ -1103,6 +1105,44 @@ export function SettingsScreen() {
       >
         {reclustering ? t(language, "reclustering") : t(language, "forceRecluster")}
       </button>
+
+      {/* Wipe All Data */}
+      <p className="settings-label" style={{ marginTop: 28 }}>{t(language, "wipeAllData")}</p>
+      {wipeConfirm ? (
+        <div className="settings-group">
+          <p style={{ padding: "12px 16px", fontSize: 14, color: "var(--color-text-secondary)" }}>
+            {t(language, "wipeAllDataConfirm")}
+          </p>
+          <div style={{ display: "flex", borderTop: "0.5px solid var(--color-separator)" }}>
+            <button
+              className="settings-row"
+              style={{ flex: 1, justifyContent: "center", color: "var(--color-text-secondary)" }}
+              onClick={() => setWipeConfirm(false)}
+            >
+              Cancel
+            </button>
+            <button
+              className="settings-row"
+              style={{ flex: 1, justifyContent: "center", color: "var(--color-destructive, #ff3b30)", borderLeft: "0.5px solid var(--color-separator)", fontWeight: 600 }}
+              disabled={wiping}
+              onClick={async () => {
+                setWiping(true);
+                try {
+                  await wipeAllData();
+                  queryClient.invalidateQueries({ queryKey: clusterKeys.all() });
+                } catch (e) { console.error(e); }
+                finally { setWiping(false); setWipeConfirm(false); }
+              }}
+            >
+              {wiping ? t(language, "wipingData") : t(language, "wipeAllData")}
+            </button>
+          </div>
+        </div>
+      ) : (
+        <button className="danger-btn" onClick={() => setWipeConfirm(true)}>
+          {t(language, "wipeAllData")}
+        </button>
+      )}
 
       {/* About */}
       <div className="settings-about">

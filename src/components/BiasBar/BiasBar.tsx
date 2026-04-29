@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useState, useMemo } from "react";
 import type { BiasCoverage } from "@/types";
 import { getActiveBiasSegments } from "@/utils/bias";
 import { t } from "@/utils/i18n";
@@ -12,7 +12,7 @@ interface BiasBarProps {
 export function BiasBar({ coverage, compact = false }: BiasBarProps) {
   const lang = useAppStore(s => s.language);
   const [active, setActive] = useState<string | null>(null);
-  const segments = getActiveBiasSegments(coverage);
+  const segments = useMemo(() => getActiveBiasSegments(coverage), [coverage]);
   if (!segments.length) return null;
 
   return (

@@ -13,6 +13,11 @@ pub struct ClusterData {
     /// Pre-tokenized forms of `headlines` — kept in sync so `assign_cluster`
     /// never re-tokenizes the same headline twice.
     pub tokenized_headlines: Vec<Vec<Token>>,
+    /// Union of all token words across every headline in this cluster.
+    /// Used as a fast-reject filter: a new article must share at least
+    /// MIN_SHARED_TOKENS distinct tokens with this set before cosine similarity
+    /// is computed. Also used by `build_idf_table` to avoid re-tokenizing.
+    pub token_set: HashSet<String>,
     pub last_updated: String, // ISO 8601
 }
 
@@ -46,18 +51,38 @@ const STOP_WORDS: &[&str] = &[
     "that", "this", "they", "their", "them", "then", "than", "these",
     "those", "were", "what", "when", "where", "which", "while", "with",
     "will", "would", "could", "should",
+    // News-domain institutional terms — too common across unrelated stories
+    // to discriminate between them; removing these forces clustering to rely
+    // on specific names, numbers, and places instead.
+    "police", "court", "judge", "magistrate", "tribunal",
+    "arrest", "arrested", "charged", "convicted", "sentenced", "jailed",
+    "victim", "suspect", "accused", "guilty", "crime", "criminal",
+    "government", "minister", "ministry", "parliament", "opposition",
+    "council", "authority", "commission", "board", "committee",
+    "public", "national", "local", "european", "international",
+    "million", "billion", "percent", "according",
+    "company", "business", "sector",
+    "school", "university", "hospital",
+    "development", "project", "plan", "proposed", "scheme",
+    "decision", "proposal", "issue", "issues",
+    "man", "woman", "family", "children", "residents", "person",
+    "found", "given", "asked", "major", "official", "officials",
 ];
 
 /// Similarity thresholds.
-const COSINE_BASE: f32 = 0.28;
+const COSINE_BASE: f32 = 0.35;
 /// Lowered threshold when a high-specificity proper noun or number is shared.
-const COSINE_ANCHOR: f32 = 0.20;
+const COSINE_ANCHOR: f32 = 0.26;
 /// Stale-cluster penalty: multiply base threshold by this when gap > STALE_HOURS.
 const COSINE_STALE_MULT: f32 = 1.5;
 const STALE_HOURS: f64 = 72.0;
-/// Minimum IDF a token needs to qualify as an "anchor" (prevents generic proper nouns like
-/// "Police" or "Government" from triggering the lower threshold).
-const ANCHOR_MIN_IDF: f32 = 2.0;
+/// Minimum IDF a token needs to qualify as an "anchor" (prevents generic proper nouns
+/// from triggering the lower threshold).
+const ANCHOR_MIN_IDF: f32 = 3.0;
+/// Minimum distinct tokens an article must share with a cluster before
+/// cosine similarity is even computed — prevents false matches from a single
+/// generic shared word.
+const MIN_SHARED_TOKENS: usize = 2;
 
 #[derive(Clone)]
 pub struct Token {
@@ -117,16 +142,13 @@ pub fn tokenize_weighted(original: &str) -> Vec<Token> {
     let stops: HashSet<&str> = STOP_WORDS.iter().copied().collect();
     let lower = normalized.to_lowercase();
 
-    let orig_words: Vec<&str> = normalized.split(|c: char| !c.is_alphanumeric()).collect();
-    let lower_words: Vec<&str> = lower.split(|c: char| !c.is_alphanumeric()).collect();
-
-    let n = orig_words.len().min(lower_words.len());
+    // Zip the two split iterators directly — avoids collecting both into Vec<&str>.
     let mut result = Vec::new();
-
-    for i in 0..n {
-        let orig_w = orig_words[i];
-        let lw = lower_words[i];
-
+    for (i, (orig_w, lw)) in normalized
+        .split(|c: char| !c.is_alphanumeric())
+        .zip(lower.split(|c: char| !c.is_alphanumeric()))
+        .enumerate()
+    {
         if lw.len() <= 2 || stops.contains(lw) {
             continue;
         }
@@ -185,14 +207,9 @@ pub fn build_idf_table(cluster_data: &HashMap<String, ClusterData>) -> HashMap<S
     let mut df: HashMap<String, u32> = HashMap::new();
 
     for data in cluster_data.values() {
-        let mut seen: HashSet<String> = HashSet::new();
-        for headline in &data.headlines {
-            for tok in tokenize_weighted(headline) {
-                seen.insert(tok.word);
-            }
-        }
-        for word in seen {
-            *df.entry(word).or_insert(0) += 1;
+        // token_set is already the per-cluster unique word set — no re-tokenization needed.
+        for word in &data.token_set {
+            *df.entry(word.clone()).or_insert(0) += 1;
         }
     }
 
@@ -224,47 +241,47 @@ fn tfidf_cosine(
 
     let default_idf = 1.0_f32;
 
-    let a_scores: HashMap<&str, f32> = a
+    // Build a-side: store (weight, tfidf_score) for anchor detection during the b-pass.
+    let a_scores: HashMap<&str, (u32, f32)> = a
         .iter()
         .map(|t| {
             let idf_val = idf.get(t.word.as_str()).copied().unwrap_or(default_idf);
-            (t.word.as_str(), t.weight as f32 * idf_val)
+            (t.word.as_str(), (t.weight, t.weight as f32 * idf_val))
         })
         .collect();
 
-    let b_scores: HashMap<&str, f32> = b
-        .iter()
-        .map(|t| {
-            let idf_val = idf.get(t.word.as_str()).copied().unwrap_or(default_idf);
-            (t.word.as_str(), t.weight as f32 * idf_val)
-        })
-        .collect();
-
-    let dot: f32 = a_scores
-        .iter()
-        .filter_map(|(word, wa)| b_scores.get(word).map(|wb| wa * wb))
-        .sum();
-
-    if dot == 0.0 {
+    let mag_a_sq: f32 = a_scores.values().map(|(_, v)| v * v).sum();
+    if mag_a_sq == 0.0 {
         return (0.0, false);
     }
 
-    // Anchor: a shared token that is a proper noun / number AND rare enough.
-    let has_anchor = a.iter().any(|ta| {
-        ta.weight >= 2
-            && ta.word.len() >= 3
-            && b_scores.contains_key(ta.word.as_str())
-            && idf.get(ta.word.as_str()).copied().unwrap_or(0.0) >= ANCHOR_MIN_IDF
-    });
+    // Single pass over b: compute dot product, |b|², and anchor detection simultaneously.
+    // Eliminates the b_scores HashMap entirely.
+    let mut dot = 0.0_f32;
+    let mut mag_b_sq = 0.0_f32;
+    let mut has_anchor = false;
 
-    let mag_a: f32 = a_scores.values().map(|v| v * v).sum::<f32>().sqrt();
-    let mag_b: f32 = b_scores.values().map(|v| v * v).sum::<f32>().sqrt();
+    for t in b {
+        let idf_val = idf.get(t.word.as_str()).copied().unwrap_or(default_idf);
+        let wb = t.weight as f32 * idf_val;
+        mag_b_sq += wb * wb;
+        if let Some(&(a_weight, wa)) = a_scores.get(t.word.as_str()) {
+            dot += wa * wb;
+            if !has_anchor
+                && a_weight >= 2
+                && t.word.len() >= 3
+                && idf.get(t.word.as_str()).copied().unwrap_or(0.0) >= ANCHOR_MIN_IDF
+            {
+                has_anchor = true;
+            }
+        }
+    }
 
-    if mag_a == 0.0 || mag_b == 0.0 {
+    if dot == 0.0 || mag_b_sq == 0.0 {
         return (0.0, false);
     }
 
-    (dot / (mag_a * mag_b), has_anchor)
+    (dot / (mag_a_sq.sqrt() * mag_b_sq.sqrt()), has_anchor)
 }
 
 // ── Time helper ─────────────────────────────────────────────────────────────
@@ -312,7 +329,20 @@ pub fn assign_cluster(
     let mut best_id = "";
     let mut best_score = 0.0_f32;
 
+    // Collect the article's distinct token words once for the fast-reject below.
+    let article_word_set: HashSet<&str> = article_tokens.iter().map(|t| t.word.as_str()).collect();
+
     for (cid, data) in cluster_data {
+        // Fast reject: require at least MIN_SHARED_TOKENS distinct tokens in common.
+        // A single shared generic word (even after stop-word filtering) is not
+        // enough evidence that two headlines are about the same story.
+        let shared_count = article_word_set.iter()
+            .filter(|w| data.token_set.contains(**w))
+            .count();
+        if shared_count < MIN_SHARED_TOKENS {
+            continue;
+        }
+
         let is_stale = hours_between(article_published_at, &data.last_updated) > STALE_HOURS;
 
         for cluster_tokens in &data.tokenized_headlines {
@@ -375,14 +405,14 @@ fn source_score(publisher_id: &str) -> u8 {
 }
 
 /// Pick the most representative headline for a cluster.
-/// Input: (original_headline, translated_headline, language, publisher_id)
-pub fn pick_best_headline(articles: &[(String, String, String, String)]) -> String {
+/// Input: (original_headline, translated_headline, language, publisher_id, snippet)
+pub fn pick_best_headline(articles: &[(String, String, String, String, String)]) -> String {
     if articles.is_empty() {
         return String::new();
     }
     articles
         .iter()
-        .map(|(headline, translated, lang, pub_id)| {
+        .map(|(headline, translated, lang, pub_id, _snippet)| {
             let en_headline = if lang == "en" {
                 headline.as_str()
             } else if !translated.is_empty() {

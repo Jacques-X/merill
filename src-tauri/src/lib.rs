@@ -57,10 +57,25 @@ fn generate_summary_impl(headlines: &[String], snippets: &[String]) -> (String, 
     )
 }
 
-use rusqlite::Connection;
-use std::sync::Mutex;
+use r2d2::Pool;
+use r2d2_sqlite::SqliteConnectionManager;
+use std::sync::{Mutex, OnceLock};
 use std::time::Instant;
 use tauri::Manager;
+
+static HTTP_CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
+
+fn http_client() -> &'static reqwest::Client {
+    HTTP_CLIENT.get_or_init(|| {
+        reqwest::Client::builder()
+            .user_agent("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15")
+            .timeout(std::time::Duration::from_secs(15))
+            .build()
+            .expect("failed to build HTTP client")
+    })
+}
+
+type DbPool = Pool<SqliteConnectionManager>;
 
 use models::{Article, ClustersResponse, RefreshResult, StoryCluster};
 use publishers::publisher_info;
@@ -70,7 +85,7 @@ use publishers::publisher_info;
 const SCRAPE_COOLDOWN_SECS: u64 = 5 * 60;
 
 struct AppState {
-    db: Mutex<Connection>,
+    db: DbPool,
     last_scraped: Mutex<Option<Instant>>,
 }
 
@@ -81,7 +96,7 @@ async fn get_clusters(
     state: tauri::State<'_, AppState>,
     blindspots_only: bool,
 ) -> Result<ClustersResponse, String> {
-    let conn = state.db.lock().unwrap();
+    let conn = state.db.get().map_err(|e| e.to_string())?;
     let raw = db::load_clusters_light(&conn, blindspots_only).map_err(|e| e.to_string())?;
 
     // Build a fast lookup for custom publishers so their is_global flag is correct.
@@ -193,7 +208,7 @@ async fn fetch_article_body(
 ) -> Result<models::ArticleBody, String> {
     // Check if we already have body text cached in the DB.
     {
-        let conn = state.db.lock().unwrap();
+        let conn = state.db.get().map_err(|e| e.to_string())?;
         let existing: Option<(String, String)> = conn
             .query_row(
                 "SELECT body_text, image_url FROM articles WHERE id = ?1",
@@ -202,8 +217,9 @@ async fn fetch_article_body(
             )
             .ok();
         if let Some((body, image)) = existing {
-            // Only return early if we have both body text AND an image
-            if !body.is_empty() && !image.is_empty() {
+            // Return cached body if available — the caller already has the image from the
+            // article's image_url field, so we don't need both to skip the network fetch.
+            if !body.is_empty() {
                 return Ok(models::ArticleBody {
                     body_text: body,
                     image_url: image,
@@ -213,13 +229,7 @@ async fn fetch_article_body(
     }
 
     // Fetch the page and extract body + image.
-    let client = reqwest::Client::builder()
-        .user_agent("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15")
-        .timeout(std::time::Duration::from_secs(15))
-        .build()
-        .map_err(|e| e.to_string())?;
-
-    let resp = client.get(&url).send().await.map_err(|e| e.to_string())?;
+    let resp = http_client().get(&url).send().await.map_err(|e| e.to_string())?;
     let html = resp.text().await.map_err(|e| e.to_string())?;
 
     let body_text = scraper::extract_body_text(&html);
@@ -234,7 +244,7 @@ async fn fetch_article_body(
 
     // Cache in DB.
     {
-        let conn = state.db.lock().unwrap();
+        let conn = state.db.get().map_err(|e| e.to_string())?;
         if !body_text.is_empty() {
             conn.execute(
                 "UPDATE articles SET body_text = ?1 WHERE id = ?2",
@@ -276,7 +286,7 @@ async fn generate_cluster_summary(
 ) -> Result<SummaryResult, String> {
     // Return cached result if already generated.
     {
-        let conn = state.db.lock().unwrap();
+        let conn = state.db.get().map_err(|e| e.to_string())?;
         let cached: Option<(String, String)> = conn.query_row(
             "SELECT ai_headline, ai_summary FROM clusters WHERE id = ?1 AND ai_headline != ''",
             rusqlite::params![cluster_id],
@@ -296,7 +306,7 @@ async fn generate_cluster_summary(
 
     // Cache.
     {
-        let conn = state.db.lock().unwrap();
+        let conn = state.db.get().map_err(|e| e.to_string())?;
         conn.execute(
             "UPDATE clusters SET ai_headline = ?1, ai_summary = ?2 WHERE id = ?3",
             rusqlite::params![headline, summary, cluster_id],
@@ -313,15 +323,17 @@ fn get_publishers(state: tauri::State<'_, AppState>) -> Vec<models::PublisherInf
         .map(|p| publishers::publisher_info(p.id))
         .collect();
 
-    if let Ok(custom) = db::get_custom_publishers(&state.db.lock().unwrap()) {
-        for p in custom {
-            list.push(models::PublisherInfo {
-                id: p.id,
-                name: p.name,
-                bias_category: models::BiasCategory::CommercialIndependent,
-                logo_url: favicon_from_url(&p.rss_url),
-                is_global: p.is_global,
-            });
+    if let Ok(conn) = state.db.get() {
+        if let Ok(custom) = db::get_custom_publishers(&conn) {
+            for p in custom {
+                list.push(models::PublisherInfo {
+                    id: p.id,
+                    name: p.name,
+                    bias_category: models::BiasCategory::CommercialIndependent,
+                    logo_url: favicon_from_url(&p.rss_url),
+                    is_global: p.is_global,
+                });
+            }
         }
     }
     list
@@ -334,12 +346,6 @@ async fn add_custom_publisher(
     name: String,
     is_global: bool,
 ) -> Result<models::PublisherInfo, String> {
-    let client = reqwest::Client::builder()
-        .user_agent("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15")
-        .timeout(std::time::Duration::from_secs(15))
-        .build()
-        .map_err(|e| e.to_string())?;
-
     // Normalise: accept bare domains like "bbc.com" or "//bbc.com"
     let url = if url.starts_with("http://") || url.starts_with("https://") {
         url
@@ -349,7 +355,7 @@ async fn add_custom_publisher(
         format!("https://{}", url.trim_start_matches('/'))
     };
 
-    let resp = client.get(&url).send().await
+    let resp = http_client().get(&url).send().await
         .map_err(|e| format!("Could not reach URL: {}", e))?;
     // Use the final URL after any redirects (e.g. bbc.com → bbc.co.uk)
     let final_url = resp.url().to_string();
@@ -370,10 +376,10 @@ async fn add_custom_publisher(
 
         // ── Method 2: RSS via <link> discovery or common path probe ──────
         let rss_url = discover_feed_url(&html, &final_url)
-            .or(probe_common_feed_paths(&client, &final_url).await);
+            .or(probe_common_feed_paths(&final_url).await);
 
         if let Some(feed_url) = rss_url {
-            let resp2 = client.get(&feed_url).send().await
+            let resp2 = http_client().get(&feed_url).send().await
                 .map_err(|e| format!("Found feed link but could not fetch it: {}", e))?;
             let bytes2 = resp2.bytes().await.map_err(|e| e.to_string())?;
             let feed = feed_rs::parser::parse(&bytes2[..])
@@ -381,7 +387,7 @@ async fn add_custom_publisher(
             Found::Rss { scrape_url: feed_url, title: feed.title.map(|t| t.content) }
         } else {
             // ── Method 3: Google News sitemap ────────────────────────────
-            match probe_sitemap_paths(&client, &final_url).await {
+            match probe_sitemap_paths(&final_url).await {
                 Some(sitemap_url) => Found::Sitemap(sitemap_url),
                 None => {
                     // ── Method 4: HTML auto-detect ───────────────────────
@@ -434,7 +440,8 @@ async fn add_custom_publisher(
         scrape_config,
         is_global,
     };
-    db::insert_custom_publisher(&state.db.lock().unwrap(), &def).map_err(|e| e.to_string())?;
+    let conn = state.db.get().map_err(|e| e.to_string())?;
+    db::insert_custom_publisher(&conn, &def).map_err(|e| e.to_string())?;
 
     // Reset scrape cooldown so the next refresh actually fetches the new publisher
     *state.last_scraped.lock().unwrap() = None;
@@ -497,7 +504,7 @@ fn discover_feed_url(html: &str, base_url: &str) -> Option<String> {
 
 /// Try well-known feed paths on the same origin in parallel.
 /// Returns the first URL that responds with a valid RSS/Atom feed.
-async fn probe_common_feed_paths(client: &reqwest::Client, base_url: &str) -> Option<String> {
+async fn probe_common_feed_paths(base_url: &str) -> Option<String> {
     let origin = base_url.splitn(4, '/').take(3).collect::<Vec<_>>().join("/");
     let origin = origin.trim_end_matches('/');
     let paths = [
@@ -514,9 +521,8 @@ async fn probe_common_feed_paths(client: &reqwest::Client, base_url: &str) -> Op
 
     let futs: Vec<_> = paths.iter().map(|path| {
         let probe = format!("{}{}", origin, path);
-        let client = client.clone();
         async move {
-            if let Ok(resp) = client.get(&probe).send().await {
+            if let Ok(resp) = http_client().get(&probe).send().await {
                 if resp.status().is_success() {
                     if let Ok(bytes) = resp.bytes().await {
                         if feed_rs::parser::parse(&bytes[..]).is_ok() {
@@ -538,7 +544,7 @@ async fn probe_common_feed_paths(client: &reqwest::Client, base_url: &str) -> Op
 }
 
 /// Probe common Google News sitemap paths. Returns the first URL that has <news:title> entries.
-async fn probe_sitemap_paths(client: &reqwest::Client, base_url: &str) -> Option<String> {
+async fn probe_sitemap_paths(base_url: &str) -> Option<String> {
     let origin = base_url.splitn(4, '/').take(3).collect::<Vec<_>>().join("/");
     let origin = origin.trim_end_matches('/');
     let paths = [
@@ -551,9 +557,8 @@ async fn probe_sitemap_paths(client: &reqwest::Client, base_url: &str) -> Option
 
     let futs: Vec<_> = paths.iter().map(|path| {
         let probe = format!("{}{}", origin, path);
-        let client = client.clone();
         async move {
-            if let Ok(resp) = client.get(&probe).send().await {
+            if let Ok(resp) = http_client().get(&probe).send().await {
                 if resp.status().is_success() {
                     if let Ok(body) = resp.text().await {
                         // Must have at least one <news:title> to count as a news sitemap
@@ -599,10 +604,19 @@ async fn split_cluster(
     published_at: String,
 ) -> Result<String, String> {
     let new_cluster_id = uuid::Uuid::new_v4().to_string();
-    let conn = state.db.lock().unwrap();
+    let conn = state.db.get().map_err(|e| e.to_string())?;
     db::split_article_to_cluster(&conn, &article_id, &new_cluster_id, &headline, &published_at)
         .map_err(|e| e.to_string())?;
     Ok(new_cluster_id)
+}
+
+/// Delete all articles and clusters and reset the scrape cooldown.
+#[tauri::command]
+fn wipe_all_data(state: tauri::State<'_, AppState>) -> Result<(), String> {
+    let conn = state.db.get().map_err(|e| e.to_string())?;
+    db::wipe_all_data(&conn).map_err(|e| e.to_string())?;
+    *state.last_scraped.lock().unwrap() = None;
+    Ok(())
 }
 
 /// Wipe all cluster assignments and re-cluster every article in the DB from scratch.
@@ -619,18 +633,14 @@ fn remove_custom_publisher(
     state: tauri::State<'_, AppState>,
     id: String,
 ) -> Result<(), String> {
-    db::delete_custom_publisher(&state.db.lock().unwrap(), &id).map_err(|e| e.to_string())
+    let conn = state.db.get().map_err(|e| e.to_string())?;
+    db::delete_custom_publisher(&conn, &id).map_err(|e| e.to_string())
 }
 
 #[tauri::command]
 async fn translate_summary(text: String, to: String) -> Result<String, String> {
     let from = if to == "mt" { "en" } else { "mt" };
-    let client = reqwest::Client::builder()
-        .user_agent("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15")
-        .timeout(std::time::Duration::from_secs(15))
-        .build()
-        .map_err(|e| e.to_string())?;
-    translate::translate_text(&client, &text, from, &to)
+    translate::translate_text(http_client(), &text, from, &to)
         .await
         .map_err(|e| e.to_string())
 }
@@ -656,23 +666,34 @@ pub fn run() {
             std::fs::create_dir_all(&data_dir).ok();
             let db_path = data_dir.join("merill.db");
             log::info!("database at {}", db_path.display());
-            let conn = db::open(&db_path).expect("failed to open database");
 
-            // Prune articles older than 7 days at every startup to keep the DB small.
-            match db::prune_old_articles(&conn, 7) {
-                Ok(n) => log::info!("pruned {} old articles", n),
-                Err(e) => log::warn!("pruning failed: {}", e),
+            // Run migrations once with a dedicated connection, then drop it.
+            {
+                let init_conn = db::open(&db_path).expect("failed to open database");
+                match db::prune_old_articles(&init_conn, 7) {
+                    Ok(n) => log::info!("pruned {} old articles", n),
+                    Err(e) => log::warn!("pruning failed: {}", e),
+                }
             }
 
+            // Create the connection pool. WAL mode (already in migrations) allows
+            // concurrent readers while the pipeline holds its write connection.
+            let manager = r2d2_sqlite::SqliteConnectionManager::file(&db_path)
+                .with_init(db::setup_pragmas);
+            let pool = r2d2::Pool::builder()
+                .max_size(5)
+                .build(manager)
+                .expect("failed to create connection pool");
+
             app.manage(AppState {
-                db: Mutex::new(conn),
+                db: pool,
                 last_scraped: Mutex::new(None),
             });
 
             Ok(())
         })
         .plugin(tauri_plugin_opener::init())
-        .invoke_handler(tauri::generate_handler![get_clusters, get_publishers, refresh_feed, fetch_article_body, translate_summary, generate_cluster_summary, add_custom_publisher, remove_custom_publisher, split_cluster, force_recluster])
+        .invoke_handler(tauri::generate_handler![get_clusters, get_publishers, refresh_feed, fetch_article_body, translate_summary, generate_cluster_summary, add_custom_publisher, remove_custom_publisher, split_cluster, force_recluster, wipe_all_data])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
 }

@@ -39,12 +39,14 @@ export const useAppStore = create<AppState>()(persist((set, get) => ({
   setLanguage: (language) => set({ language }),
 
   toggleLocalPublisher: (id) => {
-    const ids = get().localDisabledPublisherIds;
-    set({ localDisabledPublisherIds: ids.includes(id) ? ids.filter(i => i !== id) : [...ids, id] });
+    const s = new Set(get().localDisabledPublisherIds);
+    s.has(id) ? s.delete(id) : s.add(id);
+    set({ localDisabledPublisherIds: [...s] });
   },
   toggleGlobalPublisher: (id) => {
-    const ids = get().globalDisabledPublisherIds;
-    set({ globalDisabledPublisherIds: ids.includes(id) ? ids.filter(i => i !== id) : [...ids, id] });
+    const s = new Set(get().globalDisabledPublisherIds);
+    s.has(id) ? s.delete(id) : s.add(id);
+    set({ globalDisabledPublisherIds: [...s] });
   },
   isLocalPublisherEnabled: (id) => !get().localDisabledPublisherIds.includes(id),
   isGlobalPublisherEnabled: (id) => !get().globalDisabledPublisherIds.includes(id),

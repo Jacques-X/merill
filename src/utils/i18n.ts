@@ -125,6 +125,9 @@ const strings = {
     splitFromCluster: "Remove",
     forceRecluster: "Re-cluster Feed",
     reclustering: "Re-clustering\u2026",
+    wipeAllData: "Wipe All Data",
+    wipingData: "Wiping\u2026",
+    wipeAllDataConfirm: "Are you sure? This will delete all articles and cannot be undone.",
 
     // Bias labels (short — used in bar legend)
     biasStateShort: "State",
@@ -241,6 +244,9 @@ const strings = {
     splitFromCluster: "Neħħi",
     forceRecluster: "Erġa' Raggruppa",
     reclustering: "Qed jirraggera\u2026",
+    wipeAllData: "Ħassar Kollox",
+    wipingData: "Qed iħassar\u2026",
+    wipeAllDataConfirm: "Ċert? Dan se jħassar l-artikli kollha u ma jistax jiġi revokat.",
 
     biasStateShort: "Stat",
     biasPlShort: "PL",

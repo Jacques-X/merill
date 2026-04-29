@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback, useRef } from "react";
+import { useState, useEffect, useCallback, useRef, memo } from "react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { FeedScreen, SettingsScreen, StoryDetailScreen } from "@/screens";
 import type { FeedFilter } from "@/screens";
@@ -22,7 +22,7 @@ function useThemeSync() {
 }
 
 /* ── Bottom Dock ─────────────────────────────────────────────────────────── */
-function BottomDock({
+const BottomDock = memo(function BottomDock({
   active,
   onTabChange,
   onBack,
@@ -86,7 +86,7 @@ function BottomDock({
       </button>
     </nav>
   );
-}
+});
 
 /* ── App Shell ─────────────────────────────────────────────────────────── */
 function AppShell() {
@@ -143,12 +143,19 @@ function AppShell() {
 
   const isOverlay = showSettings || selectedCluster !== null;
 
+  const handleTabChange = useCallback((tab: FeedFilter) => {
+    setShowSettings(false);
+    setSelectedCluster(null);
+    setActiveTab(tab);
+  }, []);
+  const handleSettings = useCallback(() => setShowSettings(true), []);
+
   const dock = (
     <BottomDock
       active={activeTab}
-      onTabChange={(tab) => { setShowSettings(false); setSelectedCluster(null); setActiveTab(tab); }}
+      onTabChange={handleTabChange}
       onBack={handleBack}
-      onSettings={() => setShowSettings(true)}
+      onSettings={handleSettings}
       mode={isOverlay ? "overlay" : "feed"}
     />
   );

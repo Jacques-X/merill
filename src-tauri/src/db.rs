@@ -38,8 +38,11 @@ pub fn open(path: &std::path::Path) -> Result<Connection> {
             ai_summary       TEXT DEFAULT ''
         );
 
-        CREATE INDEX IF NOT EXISTS idx_articles_cluster ON articles(cluster_id);
+        CREATE INDEX IF NOT EXISTS idx_articles_cluster   ON articles(cluster_id);
         CREATE INDEX IF NOT EXISTS idx_articles_published ON articles(published_at);
+        CREATE INDEX IF NOT EXISTS idx_articles_publisher ON articles(publisher_id);
+        CREATE INDEX IF NOT EXISTS idx_articles_language  ON articles(language);
+        CREATE INDEX IF NOT EXISTS idx_articles_category  ON articles(category);
 
         CREATE TABLE IF NOT EXISTS custom_publishers (
             id             TEXT PRIMARY KEY,
@@ -52,64 +55,43 @@ pub fn open(path: &std::path::Path) -> Result<Connection> {
         ",
     )?;
 
-    // Migration: add scrape_method / scrape_config columns if missing
-    if conn.prepare("SELECT scrape_method FROM custom_publishers LIMIT 0").is_err() {
+    // Read all column names in one PRAGMA call per table — replaces 6 separate prepare() probes.
+    let col_names = |table: &str| -> rusqlite::Result<std::collections::HashSet<String>> {
+        let mut stmt = conn.prepare(&format!("PRAGMA table_info({})", table))?;
+        let names = stmt
+            .query_map([], |row| row.get::<_, String>(1))?
+            .filter_map(|r| r.ok())
+            .collect();
+        Ok(names)
+    };
+    let articles_cols    = col_names("articles")?;
+    let clusters_cols    = col_names("clusters")?;
+    let custom_pubs_cols = col_names("custom_publishers")?;
+
+    if !custom_pubs_cols.contains("scrape_method") {
         conn.execute_batch(
             "ALTER TABLE custom_publishers ADD COLUMN scrape_method TEXT NOT NULL DEFAULT 'rss';
              ALTER TABLE custom_publishers ADD COLUMN scrape_config TEXT NOT NULL DEFAULT '';",
         )?;
         log::info!("migrated: added scrape_method, scrape_config to custom_publishers");
     }
-
-    // Migration: add translated_headline column if missing
-    let has_col: bool = conn
-        .prepare("SELECT translated_headline FROM articles LIMIT 0")
-        .is_ok();
-    if !has_col {
-        conn.execute_batch(
-            "ALTER TABLE articles ADD COLUMN translated_headline TEXT DEFAULT ''",
-        )?;
+    if !articles_cols.contains("translated_headline") {
+        conn.execute_batch("ALTER TABLE articles ADD COLUMN translated_headline TEXT DEFAULT ''")?;
         log::info!("migrated: added translated_headline column");
     }
-
-    // Migration: add body_text column if missing
-    let has_body: bool = conn
-        .prepare("SELECT body_text FROM articles LIMIT 0")
-        .is_ok();
-    if !has_body {
-        conn.execute_batch(
-            "ALTER TABLE articles ADD COLUMN body_text TEXT DEFAULT ''",
-        )?;
+    if !articles_cols.contains("body_text") {
+        conn.execute_batch("ALTER TABLE articles ADD COLUMN body_text TEXT DEFAULT ''")?;
         log::info!("migrated: added body_text column");
     }
-
-    // Migration: add embedding column for fastembed vectors if missing
-    let has_embedding: bool = conn
-        .prepare("SELECT embedding FROM articles LIMIT 0")
-        .is_ok();
-    if !has_embedding {
-        conn.execute_batch(
-            "ALTER TABLE articles ADD COLUMN embedding BLOB",
-        )?;
+    if !articles_cols.contains("embedding") {
+        conn.execute_batch("ALTER TABLE articles ADD COLUMN embedding BLOB")?;
         log::info!("migrated: added embedding column");
     }
-
-    // Migration: add category column if missing
-    let has_category: bool = conn
-        .prepare("SELECT category FROM articles LIMIT 0")
-        .is_ok();
-    if !has_category {
-        conn.execute_batch(
-            "ALTER TABLE articles ADD COLUMN category TEXT DEFAULT 'general'",
-        )?;
+    if !articles_cols.contains("category") {
+        conn.execute_batch("ALTER TABLE articles ADD COLUMN category TEXT DEFAULT 'general'")?;
         log::info!("migrated: added category column");
     }
-
-    // Migration: add ai_headline / ai_summary to clusters if missing
-    let has_ai: bool = conn
-        .prepare("SELECT ai_headline FROM clusters LIMIT 0")
-        .is_ok();
-    if !has_ai {
+    if !clusters_cols.contains("ai_headline") {
         conn.execute_batch(
             "ALTER TABLE clusters ADD COLUMN ai_headline TEXT DEFAULT '';
              ALTER TABLE clusters ADD COLUMN ai_summary  TEXT DEFAULT '';",
@@ -118,6 +100,17 @@ pub fn open(path: &std::path::Path) -> Result<Connection> {
     }
 
     Ok(conn)
+}
+
+/// Per-connection PRAGMA setup used by the r2d2 pool's `with_init` callback.
+/// Migrations (CREATE TABLE / ALTER TABLE) run once via `open()` at startup and
+/// do not need to repeat for every pooled connection.
+pub fn setup_pragmas(conn: &mut rusqlite::Connection) -> rusqlite::Result<()> {
+    conn.execute_batch(
+        "PRAGMA journal_mode = WAL;
+         PRAGMA foreign_keys = ON;
+         PRAGMA busy_timeout = 5000;",
+    )
 }
 
 // ── Maintenance ──────────────────────────────────────────────────────────────
@@ -193,41 +186,35 @@ pub fn get_existing_article_ids(conn: &Connection, ids: &[&str]) -> Result<std::
 }
 
 /// Insert an article if it doesn't already exist. Returns true if inserted.
+/// Uses `prepare_cached` so the statement is compiled once per connection and reused
+/// across calls — important when inserting many articles inside a single transaction.
 pub fn insert_article(conn: &Connection, a: &RawArticle) -> Result<bool> {
-    let changed = conn.execute(
+    let mut stmt = conn.prepare_cached(
         "INSERT OR IGNORE INTO articles (id, publisher_id, original_url, headline, snippet, body_text, image_url, language, published_at, category)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
-        params![
-            a.id,
-            a.publisher_id,
-            a.original_url,
-            a.original_headline,
-            a.body_snippet,
-            a.body_text,
-            a.image_url,
-            a.language,
-            a.published_at,
-            a.category,
-        ],
     )?;
+    let changed = stmt.execute(params![
+        a.id, a.publisher_id, a.original_url, a.original_headline,
+        a.body_snippet, a.body_text, a.image_url, a.language, a.published_at, a.category,
+    ])?;
     Ok(changed > 0)
 }
 
 /// Set the translated headline for an article.
 pub fn set_translated_headline(conn: &Connection, article_id: &str, translated: &str) -> Result<()> {
-    conn.execute(
+    let mut stmt = conn.prepare_cached(
         "UPDATE articles SET translated_headline = ?1 WHERE id = ?2",
-        params![translated, article_id],
     )?;
+    stmt.execute(params![translated, article_id])?;
     Ok(())
 }
 
 /// Assign an article to a cluster.
 pub fn set_cluster(conn: &Connection, article_id: &str, cluster_id: &str) -> Result<()> {
-    conn.execute(
+    let mut stmt = conn.prepare_cached(
         "UPDATE articles SET cluster_id = ?1 WHERE id = ?2",
-        params![cluster_id, article_id],
     )?;
+    stmt.execute(params![cluster_id, article_id])?;
     Ok(())
 }
 
@@ -433,13 +420,22 @@ pub fn wipe_clusters(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
+/// Delete all articles and clusters, leaving the schema intact.
+pub fn wipe_all_data(conn: &Connection) -> Result<()> {
+    conn.execute_batch(
+        "DELETE FROM articles;
+         DELETE FROM clusters;",
+    )?;
+    Ok(())
+}
+
 /// Load every article in chronological order for re-clustering.
-/// Returns (id, original_headline, translated_headline, language, published_at).
+/// Returns (id, original_headline, translated_headline, language, published_at, snippet, publisher_id).
 pub fn load_articles_for_recluster(
     conn: &Connection,
-) -> Result<Vec<(String, String, String, String, String)>> {
+) -> Result<Vec<(String, String, String, String, String, String, String)>> {
     let mut stmt = conn.prepare(
-        "SELECT id, headline, translated_headline, language, published_at
+        "SELECT id, headline, translated_headline, language, published_at, snippet, publisher_id
          FROM articles
          ORDER BY published_at ASC",
     )?;
@@ -451,6 +447,8 @@ pub fn load_articles_for_recluster(
                 row.get::<_, String>(2).unwrap_or_default(),
                 row.get::<_, String>(3)?,
                 row.get::<_, String>(4)?,
+                row.get::<_, String>(5).unwrap_or_default(),
+                row.get::<_, String>(6).unwrap_or_default(),
             ))
         })?
         .collect::<Result<Vec<_>, _>>()?;
@@ -479,16 +477,17 @@ pub fn get_cluster_headlines(
     Ok(rows)
 }
 
-/// Load headlines for ALL clusters in a single query, grouped by cluster_id.
-/// Avoids N+1 queries during blindspot analysis.
+/// Load headlines + snippets for ALL clusters in a single query, grouped by cluster_id.
+/// Returns (headline, translated_headline, language, publisher_id, snippet).
+/// Avoids N+1 queries during blindspot analysis and cluster-data building.
 pub fn load_all_cluster_headlines(
     conn: &Connection,
-) -> Result<std::collections::HashMap<String, Vec<(String, String, String, String)>>> {
+) -> Result<std::collections::HashMap<String, Vec<(String, String, String, String, String)>>> {
     let mut stmt = conn.prepare(
-        "SELECT cluster_id, headline, translated_headline, language, publisher_id
+        "SELECT cluster_id, headline, translated_headline, language, publisher_id, snippet
          FROM articles WHERE cluster_id IS NOT NULL",
     )?;
-    let mut result: std::collections::HashMap<String, Vec<(String, String, String, String)>> =
+    let mut result: std::collections::HashMap<String, Vec<(String, String, String, String, String)>> =
         std::collections::HashMap::new();
     let rows = stmt.query_map([], |row| {
         Ok((
@@ -497,14 +496,15 @@ pub fn load_all_cluster_headlines(
             row.get::<_, String>(2).unwrap_or_default(),
             row.get::<_, String>(3)?,
             row.get::<_, String>(4)?,
+            row.get::<_, String>(5).unwrap_or_default(),
         ))
     })?;
     for row in rows {
-        let (cluster_id, headline, translated, language, publisher_id) = row?;
+        let (cluster_id, headline, translated, language, publisher_id, snippet) = row?;
         result
             .entry(cluster_id)
             .or_default()
-            .push((headline, translated, language, publisher_id));
+            .push((headline, translated, language, publisher_id, snippet));
     }
     Ok(result)
 }
