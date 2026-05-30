@@ -529,7 +529,7 @@ async fn fetch_html(
 }
 
 /// Check if a headline is a non-article (roundup, gallery, front pages, etc.).
-fn is_non_article_headline(title: &str) -> bool {
+pub(crate) fn is_non_article_headline(title: &str) -> bool {
     let lower = title.to_lowercase();
     lower.contains("front page")
         || lower.contains("years ago")
@@ -539,9 +539,20 @@ fn is_non_article_headline(title: &str) -> bool {
         || lower.contains("crossword")
         || lower.contains("horoscope")
         || lower.starts_with("watch:")
+        || lower.starts_with("watch |")
         || lower.starts_with("podcast:")
         || lower.starts_with("gallery:")
         || lower.starts_with("quiz:")
+        || lower.starts_with("announcements")
+        || lower.starts_with("letters to the editor")
+        || lower.contains("mass and the rosary")
+        || lower.starts_with("today's mass")
+        || lower.starts_with("today’s mass")
+        || lower.starts_with("election playbook")
+        || lower.starts_with("election desk")
+        || lower.starts_with("election history bites")
+        || lower.starts_with("times talk campaign watch")
+        || lower.contains("how our voting system works")
 }
 
 /// Check if a URL is a navigation/category link rather than an article.
@@ -1037,4 +1048,35 @@ pub async fn scrape_all(custom_pubs: &[CustomPublisherDef]) -> (Vec<RawArticle>,
 
     log::info!("total articles scraped: {}", all_articles.len());
     (all_articles, failed)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn recurring_non_story_headlines_are_filtered() {
+        let blocked = [
+            "Announcements - May 29, 2026",
+            "Letters to the editor - Friday, May 29",
+            "Today’s Mass and the Rosary",
+            "Today's Mass and the Rosary",
+            "Election Playbook: what happened today",
+            "WATCH | Election Talk with Marlene Farrugia",
+            "Election History Bites | They died in office",
+            "Times Talk Campaign Watch: The secret life of your ballot",
+            "Struggling to understand how our voting system works? There’s a website for that",
+        ];
+
+        for title in blocked {
+            assert!(is_non_article_headline(title), "{title} should be filtered");
+        }
+    }
+
+    #[test]
+    fn normal_article_headline_is_not_filtered() {
+        assert!(!is_non_article_headline(
+            "ECB revises Malta debt figure after delayed NSO publication"
+        ));
+    }
 }

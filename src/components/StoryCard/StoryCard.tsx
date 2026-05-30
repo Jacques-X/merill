@@ -1,6 +1,7 @@
 import { useState, useEffect, useMemo, memo } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { formatDistanceToNow } from "date-fns";
+import { Bookmark, EyeOff, MoreHorizontal } from "lucide-react";
 import { BiasBar } from "@/components/BiasBar/BiasBar";
 import { computeBiasCoverage } from "@/utils/bias";
 import { BIAS_COLORS } from "@/utils/constants";
@@ -35,14 +36,20 @@ const CATEGORY_COLORS: Record<string, string> = {
 interface StoryCardProps {
   cluster: StoryCluster;
   onPress?: (c: StoryCluster) => void;
+  onDismiss?: (id: string) => void;
   animationDelay?: string;
+  variant?: "lead" | "compact";
 }
 
-export const StoryCard = memo(function StoryCard({ cluster, onPress, animationDelay = "0s" }: StoryCardProps) {
+export const StoryCard = memo(function StoryCard({ cluster, onPress, onDismiss, animationDelay = "0s", variant = "compact" }: StoryCardProps) {
   const lang = useAppStore(s => s.language);
   const biasOverrides = useAppStore(s => s.publisherBiasOverrides);
+  const isSaved = useAppStore(s => s.isClusterSaved(cluster.id));
+  const toggleSavedCluster = useAppStore(s => s.toggleSavedCluster);
+  const articles = cluster.articles;
   const [imgError, setImgError] = useState(false);
   const [logoErrors, setLogoErrors] = useState<Set<string>>(new Set());
+  const [menuOpen, setMenuOpen] = useState(false);
 
   // AI-rewritten headline + summary — seeded from DB cache, then generated on first view.
   const [aiHeadline, setAiHeadline] = useState(cluster.ai_headline);
@@ -50,8 +57,8 @@ export const StoryCard = memo(function StoryCard({ cluster, onPress, animationDe
 
   useEffect(() => {
     if (aiHeadline && aiSummary) return; // already cached
-    const headlines = cluster.articles.map(a => a.translated_headline).filter(Boolean);
-    const snippets  = cluster.articles.map(a => a.snippet).filter(Boolean);
+    const headlines = articles.map(a => a.translated_headline).filter(Boolean);
+    const snippets  = articles.map(a => a.snippet).filter(Boolean);
     if (!headlines.length) return;
     invoke<{ headline: string; summary: string }>("generate_cluster_summary", {
       clusterId: cluster.id,
@@ -63,36 +70,36 @@ export const StoryCard = memo(function StoryCard({ cluster, onPress, animationDe
     }).catch(() => { /* keep fallback */ });
   // Re-run when the article count changes (new articles joined the cluster).
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [cluster.id, cluster.articles.length]);
+  }, [cluster.id, articles]);
 
   const isNew = cluster.first_reported_at > sessionBaseline.current;
   const coverage = useMemo(
-    () => computeBiasCoverage(cluster.articles, biasOverrides),
-    [cluster.articles, biasOverrides],
+    () => computeBiasCoverage(articles, biasOverrides),
+    [articles, biasOverrides],
   );
   const timeAgo = formatDistanceToNow(new Date(cluster.first_reported_at), { addSuffix: false });
-  const imageUrl = !imgError ? cluster.articles.find(a => a.image_url)?.image_url : undefined;
+  const imageUrl = !imgError ? articles.find(a => a.image_url)?.image_url : undefined;
 
   // Group articles by publisher — memoized so the reduce doesn't rerun on unrelated state changes.
-  const { uniquePubs, visiblePubs, overflow } = useMemo(() => {
-    const byPublisher = cluster.articles.reduce((acc, a) => {
+  const { visiblePubs, overflow } = useMemo(() => {
+    const byPublisher = articles.reduce((acc, a) => {
       if (!acc.has(a.publisher_id)) acc.set(a.publisher_id, []);
       acc.get(a.publisher_id)!.push(a);
       return acc;
-    }, new Map<string, typeof cluster.articles>());
+    }, new Map<string, typeof articles>());
     const unique = [...byPublisher.entries()];
-    return { uniquePubs: unique, visiblePubs: unique.slice(0, 4), overflow: Math.max(0, unique.length - 4) };
-  }, [cluster.articles]);
+    return { visiblePubs: unique.slice(0, 4), overflow: Math.max(0, unique.length - 4) };
+  }, [articles]);
 
   // Use AI summary when available, fall back to raw snippet / body_text.
   const snippet = useMemo(() => {
     if (aiSummary) return aiSummary;
-    for (const a of cluster.articles) {
+    for (const a of articles) {
       if (a.snippet) return a.snippet.slice(0, 140);
       if (a.body_text) return a.body_text.split("\n\n")[0]?.slice(0, 140);
     }
     return null;
-  }, [aiSummary, cluster.articles]);
+  }, [aiSummary, articles]);
 
   // Rough reading-time estimate — memoized to avoid repeated word-count splits.
   const readMins = useMemo(() => {
@@ -110,15 +117,91 @@ export const StoryCard = memo(function StoryCard({ cluster, onPress, animationDe
   );
 
   // Dominant category for the placeholder colour.
-  const dominantCategory = cluster.articles[0]?.category ?? "general";
+  const dominantCategory = articles[0]?.category ?? "general";
   const placeholderColor = CATEGORY_COLORS[dominantCategory] ?? CATEGORY_COLORS.general;
+  const visibleHeadline = aiHeadline || fallbackHeadline;
+
+  const stopCardAction = (e: React.MouseEvent) => e.stopPropagation();
+  const saveButton = (
+    <button
+      type="button"
+      className={`save-btn${isSaved ? " saved" : ""}`}
+      aria-label={isSaved ? t(lang, "unsave") : t(lang, "save")}
+      aria-pressed={isSaved}
+      onClick={(e) => {
+        stopCardAction(e);
+        toggleSavedCluster(cluster.id);
+      }}
+    >
+      <Bookmark size={17} fill={isSaved ? "currentColor" : "none"} />
+    </button>
+  );
+
+  if (variant === "compact") {
+    return (
+      <div
+        role="button"
+        tabIndex={0}
+        className="story-card compact animate-fade-up"
+        style={{ animationDelay }}
+        onClick={() => onPress?.(cluster)}
+        onKeyDown={(e) => {
+          if (e.key === "Enter" || e.key === " ") {
+            e.preventDefault();
+            onPress?.(cluster);
+          }
+        }}
+        aria-label={visibleHeadline}
+      >
+        <div className="compact-card-media" style={!imageUrl ? { background: `linear-gradient(135deg, ${placeholderColor}33, ${placeholderColor}11)` } : undefined}>
+          {imageUrl ? <img src={imageUrl} alt="" loading="lazy" onError={() => setImgError(true)} /> : <span>{t(lang, CATEGORY_I18N_KEYS[dominantCategory] ?? "catGeneral")}</span>}
+        </div>
+        <div className="compact-card-body">
+          <div className="compact-card-topline">
+            <span>{articles.length} {articles.length === 1 ? t(lang, "source") : t(lang, "sources")}</span>
+            <span>·</span>
+            <span>{timeAgo} {t(lang, "ago")}</span>
+          </div>
+          <h2 className="compact-card-headline">{visibleHeadline}</h2>
+          <BiasBar coverage={coverage} compact />
+        </div>
+        <div className="compact-card-save" onClick={stopCardAction}>{saveButton}</div>
+      </div>
+    );
+  }
 
   return (
-    <button
-      className="story-card animate-fade-up"
+    <div
+      role="button"
+      tabIndex={0}
+      className="story-card lead animate-fade-up"
       style={{ animationDelay }}
       onClick={() => onPress?.(cluster)}
+      onKeyDown={(e) => {
+        if (e.key === "Enter" || e.key === " ") {
+          e.preventDefault();
+          onPress?.(cluster);
+        }
+      }}
+      aria-label={visibleHeadline}
     >
+      <div className="story-card-actions" aria-label="Story actions">
+        {saveButton}
+        {onDismiss && (
+          <div className="card-overflow">
+            <button type="button" className="card-action-btn" aria-label={t(lang, "moreActions")} aria-expanded={menuOpen} onClick={(e) => { stopCardAction(e); setMenuOpen(open => !open); }}>
+              <MoreHorizontal size={18} />
+            </button>
+            {menuOpen && (
+              <button type="button" className="card-overflow-item" onClick={(e) => { stopCardAction(e); onDismiss(cluster.id); setMenuOpen(false); }}>
+                <EyeOff size={15} />
+                {t(lang, "hideStory")}
+              </button>
+            )}
+          </div>
+        )}
+      </div>
+
       {/* Image or category colour placeholder */}
       {imageUrl ? (
         <div className="story-card-img">
@@ -146,7 +229,7 @@ export const StoryCard = memo(function StoryCard({ cluster, onPress, animationDe
         {/* New badge + Headline */}
         {isNew && <span className="new-badge">{t(lang, "newBadge")}</span>}
         <h2 className="story-card-headline">
-          {aiHeadline || fallbackHeadline}
+          {visibleHeadline}
         </h2>
 
         {/* Snippet */}
@@ -200,6 +283,6 @@ export const StoryCard = memo(function StoryCard({ cluster, onPress, animationDe
           </div>
         </div>
       </div>
-    </button>
+    </div>
   );
 });

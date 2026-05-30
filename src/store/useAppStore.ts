@@ -7,11 +7,14 @@ export type ReaderFontSize = "sm" | "md" | "lg";
 interface AppState extends AppSettings {
   setTheme: (t: AppSettings["theme"]) => void;
   setLanguage: (l: AppSettings["language"]) => void;
+  setFeedScope: (scope: AppSettings["feedScope"]) => void;
   toggleLocalPublisher: (id: string) => void;
   toggleGlobalPublisher: (id: string) => void;
   isLocalPublisherEnabled: (id: string) => boolean;
   isGlobalPublisherEnabled: (id: string) => boolean;
   setPublisherBias: (id: string, category: BiasCategory) => void;
+  toggleSavedCluster: (id: string) => void;
+  isClusterSaved: (id: string) => boolean;
   // Last time the user opened the app — used to mark "New" stories.
   lastOpenedAt: string;
   touchLastOpened: () => void;
@@ -28,6 +31,7 @@ export const sessionBaseline = { current: new Date(0).toISOString() };
 export const useAppStore = create<AppState>()(persist((set, get) => ({
   theme: "system",
   language: "en",
+  feedScope: "local",
   savedClusterIds: [],
   localDisabledPublisherIds: [],
   globalDisabledPublisherIds: [],
@@ -37,15 +41,24 @@ export const useAppStore = create<AppState>()(persist((set, get) => ({
 
   setTheme: (theme) => set({ theme }),
   setLanguage: (language) => set({ language }),
+  setFeedScope: (feedScope) => set({ feedScope }),
 
   toggleLocalPublisher: (id) => {
     const s = new Set(get().localDisabledPublisherIds);
-    s.has(id) ? s.delete(id) : s.add(id);
+    if (s.has(id)) {
+      s.delete(id);
+    } else {
+      s.add(id);
+    }
     set({ localDisabledPublisherIds: [...s] });
   },
   toggleGlobalPublisher: (id) => {
     const s = new Set(get().globalDisabledPublisherIds);
-    s.has(id) ? s.delete(id) : s.add(id);
+    if (s.has(id)) {
+      s.delete(id);
+    } else {
+      s.add(id);
+    }
     set({ globalDisabledPublisherIds: [...s] });
   },
   isLocalPublisherEnabled: (id) => !get().localDisabledPublisherIds.includes(id),
@@ -53,6 +66,16 @@ export const useAppStore = create<AppState>()(persist((set, get) => ({
   setPublisherBias: (id, category) => set(s => ({
     publisherBiasOverrides: { ...s.publisherBiasOverrides, [id]: category },
   })),
+  toggleSavedCluster: (id) => {
+    const saved = new Set(get().savedClusterIds);
+    if (saved.has(id)) {
+      saved.delete(id);
+    } else {
+      saved.add(id);
+    }
+    set({ savedClusterIds: [...saved] });
+  },
+  isClusterSaved: (id) => get().savedClusterIds.includes(id),
 
   touchLastOpened: () => set({ lastOpenedAt: new Date().toISOString() }),
   setReaderFontSize: (readerFontSize) => set({ readerFontSize }),
@@ -62,6 +85,7 @@ export const useAppStore = create<AppState>()(persist((set, get) => ({
   partialize: (s) => ({
     theme: s.theme,
     language: s.language,
+    feedScope: s.feedScope,
     savedClusterIds: s.savedClusterIds,
     localDisabledPublisherIds: s.localDisabledPublisherIds,
     globalDisabledPublisherIds: s.globalDisabledPublisherIds,

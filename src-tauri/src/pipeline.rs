@@ -41,15 +41,12 @@ fn url_slug_words(url: &str) -> String {
     }
 }
 
-/// Build the text used for TF-IDF clustering:
-///   "[headline] . [snippet] . [url-slug-words]"
-/// Falls back to headline-only when snippet and slug are empty. (#4)
-fn cluster_text(headline: &str, snippet: &str, url: &str) -> String {
+/// Build the precision-first text used for TF-IDF clustering:
+///   "[headline] . [url-slug-words]"
+/// Snippets are intentionally excluded: they provide reader context, but can
+/// connect separate stories that happen to mention the same people or topic.
+fn cluster_text(headline: &str, _snippet: &str, url: &str) -> String {
     let mut parts = vec![headline.to_string()];
-    let s = snippet.trim();
-    if !s.is_empty() {
-        parts.push(s.to_string());
-    }
     let slug = url_slug_words(url);
     if !slug.is_empty() {
         parts.push(slug);
@@ -94,6 +91,14 @@ fn dominant_category(cats: &[&str]) -> String {
         .filter(|(_, c)| *c >= 2) // require at least 2 votes
         .map(|(k, _)| k.to_string())
         .unwrap_or_else(|| "general".to_string())
+}
+
+fn category_counts(cats: &[&str]) -> HashMap<String, usize> {
+    let mut counts = HashMap::new();
+    for &cat in cats {
+        *counts.entry(cat.to_string()).or_insert(0) += 1;
+    }
+    counts
 }
 
 pub struct PipelineResult {
@@ -166,14 +171,10 @@ fn process(
         let mut token_set: HashSet<String> = HashSet::new();
         let cats: Vec<&str> = articles.iter().map(|(_, _, _, _, _, c)| c.as_str()).collect();
 
-        for (h, t, lang, _, snippet, _) in articles {
+        for (h, t, lang, _, _snippet, _) in articles {
             let en = if lang == "en" { h.clone() } else if !t.is_empty() { t.clone() } else { h.clone() };
             // No URL available for already-stored articles, so skip slug for existing clusters
-            let text = if !snippet.is_empty() {
-                format!("{} . {}", en, snippet.trim())
-            } else {
-                en
-            };
+            let text = en;
             let tokens = clustering::tokenize_weighted(&text);
             for tok in &tokens {
                 token_set.insert(tok.word.clone());
@@ -188,6 +189,7 @@ fn process(
             token_set,
             last_updated: last_updated.clone(),
             category: Some(dominant_category(&cats)),
+            category_counts: category_counts(&cats),
             publisher_ids: pubs.iter().cloned().collect(),
         });
     }
@@ -254,6 +256,7 @@ fn process(
                     token_set,
                     last_updated: article.published_at.clone(),
                     category: Some(article.category.clone()),
+                    category_counts: HashMap::from([(article.category.clone(), 1)]),
                     publisher_ids: pub_set,
                 });
 
@@ -298,11 +301,12 @@ fn process(
                         data.last_updated = article.published_at.clone();
                     }
                     data.publisher_ids.insert(article.publisher_id.clone());
-                    // Update dominant category if needed
-                    let cats: Vec<&str> = article_data
-                        .get(&assignment.cluster_id)
-                        .map(|v| v.iter().map(|(_, _, _, _, _, c)| c.as_str()).collect())
-                        .unwrap_or_default();
+                    *data.category_counts.entry(article.category.clone()).or_insert(0) += 1;
+                    let cats: Vec<&str> = data
+                        .category_counts
+                        .iter()
+                        .flat_map(|(cat, count)| std::iter::repeat(cat.as_str()).take(*count))
+                        .collect();
                     data.category = Some(dominant_category(&cats));
                 }
 
@@ -422,6 +426,10 @@ pub fn recluster_all(db: &Pool<SqliteConnectionManager>) -> Result<PipelineResul
     conn.execute_batch("BEGIN")?;
     let recluster_result: Result<()> = (|| {
         for (article_id, original_headline, translated_headline, language, published_at, snippet, publisher_id, category, original_url) in &articles {
+            if scraper::is_non_article_headline(original_headline) {
+                log::debug!("skipping non-story during recluster: {:?}", original_headline);
+                continue;
+            }
             let headline = if language == "en" {
                 original_headline
             } else if !translated_headline.is_empty() {
@@ -466,6 +474,7 @@ pub fn recluster_all(db: &Pool<SqliteConnectionManager>) -> Result<PipelineResul
                     token_set,
                     last_updated: published_at.clone(),
                     category: Some(category.clone()),
+                    category_counts: HashMap::from([(category.clone(), 1)]),
                     publisher_ids: pub_set,
                 });
 
@@ -496,6 +505,13 @@ pub fn recluster_all(db: &Pool<SqliteConnectionManager>) -> Result<PipelineResul
                     data.headlines.push(text);
                     if published_at > &data.last_updated { data.last_updated = published_at.clone(); }
                     data.publisher_ids.insert(publisher_id.clone());
+                    *data.category_counts.entry(category.clone()).or_insert(0) += 1;
+                    let cats: Vec<&str> = data
+                        .category_counts
+                        .iter()
+                        .flat_map(|(cat, count)| std::iter::repeat(cat.as_str()).take(*count))
+                        .collect();
+                    data.category = Some(dominant_category(&cats));
                 }
                 if let Some((_, last, pubs)) = pub_map.get_mut(&assignment.cluster_id) {
                     if published_at > last { *last = published_at.clone(); }
@@ -586,6 +602,7 @@ pub async fn run(db: &Pool<SqliteConnectionManager>) -> Result<PipelineResult> {
     };
 
     let (mut raw_articles, failed_sources) = scraper::scrape_all(&custom_pubs).await;
+    raw_articles.retain(|article| !scraper::is_non_article_headline(&article.original_headline));
     log::info!("scraped {} articles total", raw_articles.len());
 
     {

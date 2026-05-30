@@ -2,6 +2,7 @@ import { useState, useEffect, useCallback, useRef, useMemo } from "react";
 import { useQueryClient } from "@tanstack/react-query";
 import { formatDistanceToNow } from "date-fns";
 import { invoke } from "@tauri-apps/api/core";
+import { ArrowLeft, Check, ChevronDown, ChevronRight, ExternalLink, Filter, MoreHorizontal, Plus, Settings2, Trash2, X } from "lucide-react";
 import { useClusters, usePublishers, refreshFeed, addCustomPublisher, removeCustomPublisher, splitCluster, forceRecluster, wipeAllData, clusterKeys } from "@/api/clusters";
 import { StoryCard } from "@/components/StoryCard/StoryCard";
 import { BiasBar } from "@/components/BiasBar/BiasBar";
@@ -10,7 +11,7 @@ import { BIAS_COLORS, LOCAL_BIAS_OPTIONS, GLOBAL_BIAS_OPTIONS } from "@/utils/co
 import { articleHeadline, clusterHeadline } from "@/utils/headline";
 import { t } from "@/utils/i18n";
 import { useAppStore } from "@/store/useAppStore";
-import type { StoryCluster, Category } from "@/types";
+import type { StoryCluster, Category, BiasCategory, Article } from "@/types";
 
 // ── Pull-to-Refresh Hook ────────────────────────────────────────────────────
 
@@ -136,60 +137,6 @@ function SwipeToDismiss({ children, onDismiss }: { children: React.ReactNode; on
   );
 }
 
-// ── Swipe-to-remove row (reveals red action button on left swipe) ───────────
-
-function SwipeRow({ children, onAction, label }: {
-  children: React.ReactNode;
-  onAction: () => void;
-  label: string;
-}) {
-  const [offsetX, setOffsetX] = useState(0);
-  const startX = useRef(0);
-  const startY = useRef(0);
-  const tracking = useRef(false);
-  const PEEK = 72;
-  const THRESHOLD = 48;
-
-  const handleTouchStart = (e: React.TouchEvent) => {
-    startX.current = e.touches[0].clientX;
-    startY.current = e.touches[0].clientY;
-    tracking.current = false;
-  };
-  const handleTouchMove = (e: React.TouchEvent) => {
-    const dx = e.touches[0].clientX - startX.current;
-    const dy = Math.abs(e.touches[0].clientY - startY.current);
-    if (!tracking.current && Math.abs(dx) > 8 && dy < Math.abs(dx)) tracking.current = true;
-    if (!tracking.current) return;
-    if (dx < 0) setOffsetX(Math.max(dx, -PEEK));
-    else if (offsetX < 0) setOffsetX(Math.min(0, offsetX + (dx > 0 ? dx * 0.5 : 0)));
-  };
-  const handleTouchEnd = () => {
-    if (!tracking.current) { tracking.current = false; return; }
-    tracking.current = false;
-    setOffsetX(offsetX <= -THRESHOLD ? -PEEK : 0);
-  };
-
-  return (
-    <div className="swipe-row">
-      <button className="swipe-row-action" onClick={onAction} tabIndex={-1}>
-        <span>{label}</span>
-      </button>
-      <div
-        onTouchStart={handleTouchStart}
-        onTouchMove={handleTouchMove}
-        onTouchEnd={handleTouchEnd}
-        style={{
-          transform: `translateX(${offsetX}px)`,
-          transition: tracking.current ? "none" : "transform 0.22s ease",
-          background: "var(--color-bg)",
-        }}
-      >
-        {children}
-      </div>
-    </div>
-  );
-}
-
 // ── Extractive summary: merge first paragraphs from all sources into one ──
 
 function combineSummary(bodyTexts: string[]): string {
@@ -247,22 +194,81 @@ function decodeHTMLEntities(text: string): string {
   return text.replace(/&[^;]+;/g, match => HTML_ENTITIES[match] ?? match);
 }
 
+function errorMessage(err: unknown): string {
+  return err instanceof Error ? err.message : String(err);
+}
+
+function articlePreviewText(article: Article): string {
+  return article.body_text || article.snippet || "";
+}
+
+const GROUPING_STOP_WORDS = new Set([
+  "about", "after", "are", "before", "for", "from", "its", "with", "that", "this", "they", "their", "will",
+  "would", "could", "should", "says", "said", "news", "malta", "maltese",
+  "today", "new", "more", "over", "under", "people", "government", "police", "malti",
+  "court", "minister", "local", "public", "general", "candidate", "candidates",
+  "counterpart", "counterparts", "district", "districts", "election", "elections",
+  "electoral", "vote", "votes", "voter", "voters", "voting", "campaign", "party", "leader",
+  "meeting", "chapter", "future", "lovin", "newsbook", "times", "talk", "europe",
+  "world", "cup", "trophy", "final", "league", "huma", "kandidat", "kandidati", "distrett", "distretti",
+  "tazza", "dinja",
+  "elezzjoni", "elezzjonijiet", "generali", "vot", "voti", "votazzjoni", "jivvota",
+]);
+
+function groupingTokens(text: string): Set<string> {
+  const tokens = text
+    .toLowerCase()
+    .split(/[^a-z0-9\u0100-\u017f]+/i)
+    .filter(w => w.length >= 4 && !GROUPING_STOP_WORDS.has(w));
+  return new Set(tokens);
+}
+
+function groupingEvidence(cluster: StoryCluster) {
+  const headlines = cluster.articles.map(a => articleHeadline(a, "en") || a.original_headline);
+  if (headlines.length <= 1) {
+    return { level: "single" as const, shared: [] as string[] };
+  }
+  const base = groupingTokens(headlines[0]);
+  const sharedCounts = new Map<string, number>();
+  for (const headline of headlines.slice(1)) {
+    for (const token of groupingTokens(headline)) {
+      if (base.has(token)) sharedCounts.set(token, (sharedCounts.get(token) ?? 0) + 1);
+    }
+  }
+  const shared = [...sharedCounts.entries()]
+    .filter(([, count]) => count >= 1)
+    .sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0]))
+    .slice(0, 4)
+    .map(([token]) => token);
+  const level = shared.length >= 3
+    ? "strong"
+    : shared.length >= 1
+      ? "medium"
+      : "low";
+  return { level, shared };
+}
+
 // ── Story Detail Screen ─────────────────────────────────────────────────────
 
 export function StoryDetailScreen({
   cluster,
   internalBackRef,
+  onBack,
 }: {
   cluster: StoryCluster;
   internalBackRef?: React.MutableRefObject<(() => void) | null>;
+  onBack: () => void;
 }) {
   const lang = useAppStore(s => s.language);
   const biasOverrides = useAppStore(s => s.publisherBiasOverrides);
   const readerFontSize = useAppStore(s => s.readerFontSize);
   const setReaderFontSize = useAppStore(s => s.setReaderFontSize);
-  const [selectedArticle, setSelectedArticle] = useState<import("@/types").Article | null>(null);
+  const queryClient = useQueryClient();
+  const [selectedArticle, setSelectedArticle] = useState<Article | null>(null);
   const [articleBody, setArticleBody] = useState<string>("");
   const [loadingBody, setLoadingBody] = useState(false);
+  const [articleError, setArticleError] = useState<string | null>(null);
+  const [detailActionError, setDetailActionError] = useState<string | null>(null);
   const [imgError, setImgError] = useState(false);
   const [logoErrors, setLogoErrors] = useState<Set<string>>(new Set());
   const coverage = computeBiasCoverage(cluster.articles, biasOverrides);
@@ -271,6 +277,21 @@ export function StoryDetailScreen({
   const [summaries, setSummaries] = useState<Map<string, string>>(new Map());
   const [summaryLoading, setSummaryLoading] = useState(true);
   const [translatedSummary, setTranslatedSummary] = useState<string>("");
+  const [timelineOpen, setTimelineOpen] = useState(false);
+  const [reviewOpen, setReviewOpen] = useState(false);
+  const [groupMenuOpen, setGroupMenuOpen] = useState(false);
+  const groupEvidence = useMemo(() => groupingEvidence(cluster), [cluster]);
+
+  const sortedByTime = useMemo(() =>
+    [...cluster.articles].sort((a, b) => a.published_at.localeCompare(b.published_at)),
+  [cluster.articles]);
+
+  const selectedParagraphs = useMemo(
+    () => articleBody ? articleBody.split("\n\n").filter(Boolean).map(decodeHTMLEntities) : [],
+    [articleBody],
+  );
+  const selectedDomain = selectedArticle?.original_url.replace(/^https?:\/\//, "").split("/")[0] ?? "";
+  const readingMins = Math.max(1, Math.round(articleBody.split(/\s+/).filter(Boolean).length / 200));
 
   // Register internal back with parent so dock/swipe back works correctly:
   // article open → back goes to cluster view; cluster view → back goes to feed.
@@ -284,25 +305,39 @@ export function StoryDetailScreen({
     let cancelled = false;
     setSummaryLoading(true);
 
-    async function fetchAll() {
-      const promises = cluster.articles.map((a) =>
-        invoke<{ body_text: string; image_url: string }>("fetch_article_body", {
-          articleId: a.id,
-          url: a.original_url,
-        }).then(r => ({ id: a.id, text: r.body_text }))
-          .catch(() => ({ id: a.id, text: "" }))
-      );
-      const settled = await Promise.allSettled(promises);
-      const all = settled.map(r => r.status === "fulfilled" ? r.value : { id: "", text: "" }).filter(r => r.id);
+    async function buildSummaryInputs() {
+      const seeded = cluster.articles
+        .map(a => ({ id: a.id, text: articlePreviewText(a) }))
+        .filter(r => r.text);
+      if (seeded.length > 0) {
+        if (!cancelled) {
+          setSummaries(new Map(seeded.map(r => [r.id, r.text])));
+          setSummaryLoading(false);
+        }
+        return;
+      }
+
+      const fetched: { id: string; text: string }[] = [];
+      for (const article of cluster.articles.slice(0, 2)) {
+        try {
+          const result = await invoke<{ body_text: string; image_url: string }>("fetch_article_body", {
+            articleId: article.id,
+            url: article.original_url,
+          });
+          if (result.body_text) fetched.push({ id: article.id, text: result.body_text });
+        } catch {
+          // Summary can fall back to no text; opening the article still reports errors.
+        }
+      }
       if (cancelled) return;
       const results = new Map<string, string>();
-      for (const { id, text } of all) {
+      for (const { id, text } of fetched) {
         if (text) results.set(id, text);
       }
       setSummaries(results);
       setSummaryLoading(false);
     }
-    fetchAll();
+    buildSummaryInputs();
     return () => { cancelled = true; };
   }, [cluster.articles]);
 
@@ -327,8 +362,9 @@ export function StoryDetailScreen({
     return () => { cancelled = true; };
   }, [summaryLoading, summaries, lang, cluster.articles]);
 
-  const openArticle = useCallback(async (a: import("@/types").Article) => {
+  const openArticle = useCallback(async (a: Article) => {
     setSelectedArticle(a);
+    setArticleError(null);
     const cached = summaries.get(a.id);
     setArticleBody(cached || a.body_text || "");
     if (!cached && !a.body_text) {
@@ -341,23 +377,40 @@ export function StoryDetailScreen({
         setArticleBody(result.body_text);
       } catch (e) {
         console.error("failed to fetch article body:", e);
+        setArticleError(errorMessage(e));
       } finally {
         setLoadingBody(false);
       }
     }
   }, [summaries]);
 
+  const handleSplit = useCallback(async (article: Article) => {
+    const headline = article.language === "en" ? article.original_headline : (article.translated_headline || article.original_headline);
+    setDetailActionError(null);
+    try {
+      await splitCluster(article.id, headline, article.published_at);
+      await queryClient.invalidateQueries({ queryKey: clusterKeys.all() });
+    } catch (err) {
+      setDetailActionError(t(lang, "splitClusterError"));
+      console.error("split cluster failed:", err);
+    }
+  }, [lang, queryClient]);
+
   // ── Article Reader View
   if (selectedArticle) {
     const a = selectedArticle;
-    const paragraphs = articleBody ? articleBody.split("\n\n").filter(Boolean).map(decodeHTMLEntities) : [];
-    const domain = a.original_url.replace(/^https?:\/\//, "").split("/")[0];
-    const wordCount = articleBody.split(/\s+/).filter(Boolean).length;
-    const readingMins = Math.max(1, Math.round(wordCount / 200));
 
     return (
       <SwipeToDismiss onDismiss={() => setSelectedArticle(null)}>
       <div className="animate-fade-up detail-scroll">
+        <header className="overlay-topbar">
+          <button className="overlay-icon-btn" onClick={() => setSelectedArticle(null)} aria-label={t(lang, "back")}><ArrowLeft size={21} /></button>
+          <div className="overlay-title">
+            <span>{a.publisher.name}</span>
+            <small>{formatDistanceToNow(new Date(a.published_at), { addSuffix: true })}</small>
+          </div>
+          <a className="overlay-icon-btn" href={a.original_url} target="_blank" rel="noopener noreferrer" aria-label={`${t(lang, "readOn")} ${selectedDomain}`}><ExternalLink size={18} /></a>
+        </header>
         {a.image_url && (
           <div className="detail-hero">
             <img src={a.image_url} alt="" />
@@ -379,14 +432,8 @@ export function StoryDetailScreen({
             </div>
             <div style={{ flex: 1 }}>
               <p className="detail-pub-name">{a.publisher.name}</p>
-              <p className="detail-pub-time">
-                {formatDistanceToNow(new Date(a.published_at), { addSuffix: true })}
-                {paragraphs.length > 0 && (
-                  <span className="reading-time"> · ~{readingMins} {t(lang, "minRead")}</span>
-                )}
-              </p>
+              {selectedParagraphs.length > 0 && <p className="detail-pub-time">~{readingMins} {t(lang, "minRead")}</p>}
             </div>
-            {/* Font size controls */}
             <div className="font-controls">
               <button
                 className="font-btn"
@@ -403,9 +450,13 @@ export function StoryDetailScreen({
 
           <h2 className="detail-headline">{articleHeadline(a, lang)}</h2>
 
-          {paragraphs.length > 0 ? (
+          {articleError && (
+            <div className="inline-error">{t(lang, "articleLoadError")}</div>
+          )}
+
+          {selectedParagraphs.length > 0 ? (
             <div className={`detail-body font-${readerFontSize}`}>
-              {paragraphs.map((p, i) => (<p key={i}>{p}</p>))}
+              {selectedParagraphs.map((p, i) => (<p key={i}>{p}</p>))}
             </div>
           ) : loadingBody ? (
             <div className="detail-loading">
@@ -421,12 +472,8 @@ export function StoryDetailScreen({
           )}
 
           <a href={a.original_url} target="_blank" rel="noopener noreferrer" className="read-original-btn">
-            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="var(--color-accent)" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-              <path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6" />
-              <polyline points="15 3 21 3 21 9" />
-              <line x1="10" y1="14" x2="21" y2="3" />
-            </svg>
-            {t(lang, "readOn")} {domain}
+            <ExternalLink size={16} />
+            {t(lang, "readOn")} {selectedDomain}
           </a>
 
           <button onClick={() => setSelectedArticle(null)} className="back-to-sources">
@@ -438,23 +485,20 @@ export function StoryDetailScreen({
     );
   }
 
-  // ── Cluster Overview with combined summary
-  const sortedByTime = useMemo(() =>
-    [...cluster.articles].sort((a, b) => a.published_at.localeCompare(b.published_at)),
-  [cluster.articles]);
-
-  const plArticle = useMemo(() =>
-    cluster.articles.find(a => (biasOverrides[a.publisher_id] ?? a.publisher.bias_category) === "party_owned_pl"),
-  [cluster.articles, biasOverrides]);
-
-  const pnArticle = useMemo(() =>
-    cluster.articles.find(a => (biasOverrides[a.publisher_id] ?? a.publisher.bias_category) === "party_owned_pn"),
-  [cluster.articles, biasOverrides]);
-
-  const [compareOpen, setCompareOpen] = useState(false);
-
   return (
     <div className="animate-fade-up detail-scroll">
+      <header className="overlay-topbar">
+        <button className="overlay-icon-btn" onClick={onBack} aria-label={t(lang, "back")}><ArrowLeft size={21} /></button>
+        <span className="overlay-title single">{t(lang, "storyGroup")}</span>
+        <div className="detail-menu-wrap">
+          <button className="overlay-icon-btn" onClick={() => setGroupMenuOpen(open => !open)} aria-label={t(lang, "moreActions")} aria-expanded={groupMenuOpen}><MoreHorizontal size={21} /></button>
+          {groupMenuOpen && (
+            <button className="detail-menu-popover" onClick={() => { setReviewOpen(true); setGroupMenuOpen(false); }}>
+              <Settings2 size={16} /> {t(lang, "reviewGrouping")}
+            </button>
+          )}
+        </div>
+      </header>
       {imageUrl && (
         <div className="detail-hero tall">
           <img src={imageUrl} alt="" onError={() => setImgError(true)} />
@@ -484,77 +528,39 @@ export function StoryDetailScreen({
           <BiasBar coverage={coverage} />
         </div>
 
-        {/* ── Both-sides compare ── */}
-        {plArticle && pnArticle && (
-          <div className="compare-section">
-            <button className="compare-toggle" onClick={() => setCompareOpen(o => !o)}>
-              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-                <path d="M18 3H6a3 3 0 0 0-3 3v12a3 3 0 0 0 3 3h12a3 3 0 0 0 3-3V6a3 3 0 0 0-3-3z" />
-                <line x1="12" y1="3" x2="12" y2="21" />
-              </svg>
-              {t(lang, "compareFraming")}
-              <svg className={`compare-chevron ${compareOpen ? "open" : ""}`} width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round">
-                <path d="M6 9l6 6 6-6" />
-              </svg>
-            </button>
-            {compareOpen && (
-              <div className="compare-cols">
-                <div className="compare-col pl">
-                  <span className="compare-label" style={{ color: BIAS_COLORS.party_owned_pl }}>{t(lang, "labourSays")}</span>
-                  <p className="compare-headline">{articleHeadline(plArticle, lang)}</p>
-                  {plArticle.snippet && <p className="compare-snippet">{plArticle.snippet}</p>}
-                </div>
-                <div className="compare-divider" />
-                <div className="compare-col pn">
-                  <span className="compare-label" style={{ color: BIAS_COLORS.party_owned_pn }}>{t(lang, "nationalistSays")}</span>
-                  <p className="compare-headline">{articleHeadline(pnArticle, lang)}</p>
-                  {pnArticle.snippet && <p className="compare-snippet">{pnArticle.snippet}</p>}
-                </div>
-              </div>
-            )}
-          </div>
+        {detailActionError && (
+          <div className="inline-error">{detailActionError}</div>
         )}
 
-        <div className="source-headlines">
+        <div className="section-heading">
+          <span>{t(lang, "perspectives")}</span>
+          <small>{t(lang, "swipeToCompare")}</small>
+        </div>
+        <div className="perspective-carousel">
           {cluster.articles.map(a => (
-            <SwipeRow
-              key={a.id}
-              label={t(lang, "splitFromCluster")}
-              onAction={async () => {
-                const headline = a.language === "en" ? a.original_headline : (a.translated_headline || a.original_headline);
-                await splitCluster(a.id, headline, a.published_at).catch(() => {});
-                // Parent will re-fetch on next query invalidation; for now just show the detail gone.
-              }}
-            >
-              <button className="source-headline-row" onClick={() => openArticle(a)}>
-                <div className="source-avatar sm" style={{
-                  backgroundColor: BIAS_COLORS[biasOverrides[a.publisher_id] ?? a.publisher.bias_category] ?? "#8E8E93",
-                }}>
-                  {a.publisher.logo_url && !logoErrors.has(a.id) ? (
-                    <img src={a.publisher.logo_url} alt={a.publisher.name}
-                      onError={() => setLogoErrors(s => new Set(s).add(a.id))} />
-                  ) : (
-                    <span>{a.publisher.name.slice(0, 2).toUpperCase()}</span>
-                  )}
+            <article key={a.id} className="perspective-card">
+              <div className="perspective-publisher">
+                <div className="source-avatar sm" style={{ backgroundColor: BIAS_COLORS[biasOverrides[a.publisher_id] ?? a.publisher.bias_category] ?? "#8E8E93" }}>
+                  {a.publisher.logo_url && !logoErrors.has(a.id) ? <img src={a.publisher.logo_url} alt={a.publisher.name} onError={() => setLogoErrors(s => new Set(s).add(a.id))} /> : <span>{a.publisher.name.slice(0, 2).toUpperCase()}</span>}
                 </div>
-                <div className="source-headline-text">
-                  <p className="source-headline">
-                    {articleHeadline(a, lang)}
-                  </p>
-                  <span className="source-headline-meta">
-                    {a.publisher.name} · {formatDistanceToNow(new Date(a.published_at), { addSuffix: true })}
-                  </span>
-                </div>
+                <span>{a.publisher.name}</span>
+                <small>{formatDistanceToNow(new Date(a.published_at), { addSuffix: true })}</small>
+              </div>
+              <h3>{articleHeadline(a, lang)}</h3>
+              {a.snippet && <p>{decodeHTMLEntities(a.snippet)}</p>}
+              <button className="perspective-open" onClick={() => openArticle(a)}>
+                {t(lang, "openArticle")} <ChevronRight size={16} />
               </button>
-            </SwipeRow>
+            </article>
           ))}
         </div>
 
-        {/* ── Story timeline ── */}
         {sortedByTime.length > 1 && (
-          <div className="timeline-section">
-            <p className="settings-label">{t(lang, "storyTimeline")}</p>
-            <div className="timeline-list">
+          <div className="disclosure-panel">
+            <button className="disclosure-trigger" onClick={() => setTimelineOpen(open => !open)} aria-expanded={timelineOpen}>
+              {t(lang, "storyTimeline")} <ChevronDown size={17} className={timelineOpen ? "open" : ""} />
+            </button>
+            {timelineOpen && <div className="timeline-list">
               {sortedByTime.map((a, i) => (
                 <div key={a.id} className="timeline-item">
                   <div className="timeline-track">
@@ -570,20 +576,55 @@ export function StoryDetailScreen({
                   </div>
                 </div>
               ))}
-            </div>
+            </div>}
           </div>
         )}
       </div>
+      {reviewOpen && (
+        <div className="sheet-backdrop" onClick={() => setReviewOpen(false)}>
+          <section className="bottom-sheet" onClick={event => event.stopPropagation()} aria-modal="true" role="dialog" aria-label={t(lang, "reviewGrouping")}>
+            <div className="sheet-header">
+              <div><h3>{t(lang, "reviewGrouping")}</h3><p>{t(lang, "reviewGroupingSub")}</p></div>
+              <button className="overlay-icon-btn" onClick={() => setReviewOpen(false)} aria-label={t(lang, "close")}><X size={19} /></button>
+            </div>
+            <div className={`cluster-confidence ${groupEvidence.level}`}>
+              <span>{t(lang, "groupingConfidence")}</span>
+              <strong>{t(lang, GROUPING_I18N[groupEvidence.level])}</strong>
+              {groupEvidence.shared.length > 0 && <small>{groupEvidence.shared.join(", ")}</small>}
+            </div>
+            <div className="review-source-list">
+              {cluster.articles.map(article => (
+                <div key={article.id} className="review-source-row">
+                  <div><strong>{article.publisher.name}</strong><span>{articleHeadline(article, lang)}</span></div>
+                  <button onClick={() => handleSplit(article)} aria-label={`${t(lang, "splitFromCluster")}: ${article.publisher.name}`}><Trash2 size={16} /></button>
+                </div>
+              ))}
+            </div>
+          </section>
+        </div>
+      )}
     </div>
   );
 }
 
 // ── Skeletons ────────────────────────────────────────────────────────────────
 
-function CardSkeleton({ delay = "0s", showImage = false }: { delay?: string; showImage?: boolean }) {
+function CardSkeleton({ delay = "0s", variant = "compact" }: { delay?: string; variant?: "lead" | "compact" }) {
+  if (variant === "compact") {
+    return (
+      <div className="story-card compact skeleton-card animate-fade-up" style={{ animationDelay: delay }}>
+        <div className="skeleton compact-card-media" />
+        <div className="compact-card-body">
+          <div className="skeleton" style={{ height: 10, width: "45%" }} />
+          <div className="skeleton" style={{ height: 15, width: "94%" }} />
+          <div className="skeleton" style={{ height: 15, width: "70%" }} />
+        </div>
+      </div>
+    );
+  }
   return (
     <div className="story-card skeleton-card animate-fade-up" style={{ animationDelay: delay }}>
-      {showImage && <div className="skeleton" style={{ width: "100%", height: 200, borderRadius: 0 }} />}
+      <div className="skeleton" style={{ width: "100%", height: 200, borderRadius: 0 }} />
       <div style={{ padding: 16, display: "flex", flexDirection: "column", gap: 12 }}>
         <div className="skeleton" style={{ height: 16, width: "90%" }} />
         <div className="skeleton" style={{ height: 16, width: "70%" }} />
@@ -604,8 +645,16 @@ const CAT_I18N: Record<string, import("@/utils/i18n").LangKey> = {
   international: "catInternational", crime: "catCrime", business: "catBusiness",
   opinion: "catOpinion", entertainment: "catEntertainment", general: "catGeneral",
 };
+const GROUPING_I18N: Record<ReturnType<typeof groupingEvidence>["level"], import("@/utils/i18n").LangKey> = {
+  single: "groupingSingle",
+  low: "groupingLow",
+  medium: "groupingMedium",
+  strong: "groupingStrong",
+};
 
 export type FeedFilter = "local" | "global";
+type FeedSort = "balanced" | "latest" | "covered";
+type FeedRootView = "feed" | "blindspots" | "saved";
 
 const INDEPENDENT_BIAS: BiasCategory[] = ["commercial_independent", "investigative_independent"];
 
@@ -620,23 +669,38 @@ function recomputeBlindspot(articles: StoryCluster["articles"], overrides: Recor
 export function FeedScreen({
   onSelectCluster,
   filter = "local",
+  onFilterChange,
+  rootView = "feed",
+  onOpenSettings,
 }: {
   onSelectCluster: (c: StoryCluster) => void;
   filter?: FeedFilter;
+  onFilterChange: (filter: FeedFilter) => void;
+  rootView?: FeedRootView;
+  onOpenSettings: () => void;
 }) {
   const lang = useAppStore(s => s.language);
   const localDisabledPublisherIds = useAppStore(s => s.localDisabledPublisherIds);
   const globalDisabledPublisherIds = useAppStore(s => s.globalDisabledPublisherIds);
   const biasOverrides = useAppStore(s => s.publisherBiasOverrides);
+  const savedClusterIds = useAppStore(s => s.savedClusterIds);
   const queryClient = useQueryClient();
   const { data, isLoading, isError, refetch } = useClusters();
+  const { data: publishers = [], isLoading: publishersLoading } = usePublishers();
   const [refreshing, setRefreshing] = useState(false);
   const [shuffleKey, setShuffleKey] = useState(0);
   const [activeCategory, setActiveCategory] = useState<"all" | Category>("all");
+  const [feedSort, setFeedSort] = useState<FeedSort>("balanced");
+  const [filtersOpen, setFiltersOpen] = useState(false);
   const [failedSources, setFailedSources] = useState<string[]>([]);
+  const [refreshError, setRefreshError] = useState<string | null>(null);
   const [dismissedIds, setDismissedIds] = useState<Set<string>>(new Set());
 
-  const rawClusters = data?.clusters ?? [];
+  const rawClusters = useMemo(() => data?.clusters ?? [], [data?.clusters]);
+  const enabledPublisherCount = useMemo(() => {
+    const disabled = filter === "local" ? localDisabledPublisherIds : globalDisabledPublisherIds;
+    return publishers.filter(p => (filter === "local" ? !p.is_global : p.is_global) && !disabled.includes(p.id)).length;
+  }, [publishers, filter, localDisabledPublisherIds, globalDisabledPublisherIds]);
 
   // Pin shuffle scores in a ref — only recompute when shuffleKey changes.
   const shuffleScores = useRef<Map<string, number>>(new Map());
@@ -676,20 +740,33 @@ export function FeedScreen({
       })
       .filter(c => c.articles.length > 0);
 
+    if (rootView === "saved") {
+      arr = arr.filter(c => savedClusterIds.includes(c.id));
+    } else if (rootView === "blindspots") {
+      arr = arr.filter(c => c.is_blindspot);
+    }
+
     // Apply category filter.
     if (activeCategory !== "all") {
       arr = arr.filter(c => c.articles.some(a => a.category === activeCategory));
     }
 
-    arr.sort((a, b) =>
-      (shuffleScores.current.get(b.id) ?? 0) - (shuffleScores.current.get(a.id) ?? 0)
-    );
+    if (feedSort === "latest") {
+      arr.sort((a, b) => b.last_updated.localeCompare(a.last_updated));
+    } else if (feedSort === "covered") {
+      arr.sort((a, b) => b.articles.length - a.articles.length || b.last_updated.localeCompare(a.last_updated));
+    } else {
+      arr.sort((a, b) =>
+        (shuffleScores.current.get(b.id) ?? 0) - (shuffleScores.current.get(a.id) ?? 0)
+      );
+    }
     return arr;
-  }, [rawClusters, shuffleKey, activeCategory, filter, localDisabledPublisherIds, globalDisabledPublisherIds, biasOverrides]);
+  }, [rawClusters, shuffleKey, activeCategory, feedSort, rootView, savedClusterIds, filter, localDisabledPublisherIds, globalDisabledPublisherIds, biasOverrides]);
 
   const handleRefresh = useCallback(async () => {
     setRefreshing(true);
     setFailedSources([]);
+    setRefreshError(null);
     try {
       const result = await refreshFeed();
       if (result.failed_sources.length > 0) {
@@ -697,7 +774,10 @@ export function FeedScreen({
       }
       await queryClient.invalidateQueries({ queryKey: clusterKeys.all() });
       await refetch();
-    } catch (e) { console.error("refresh failed:", e); }
+    } catch (e) {
+      console.error("refresh failed:", e);
+      setRefreshError(errorMessage(e));
+    }
     finally { setShuffleKey(k => k + 1); setRefreshing(false); }
   }, [queryClient, refetch]);
 
@@ -714,11 +794,11 @@ export function FeedScreen({
     }
   }, [isLoading, rawClusters.length, didAutoRefresh, handleRefresh]);
 
-  if (isLoading || (isRefreshing && rawClusters.length === 0))
+  if (isLoading || publishersLoading || (isRefreshing && rawClusters.length === 0))
     return (
       <div className="feed-list">
-        <CardSkeleton delay="0s" showImage />
-        {[...Array(2)].map((_, i) => <CardSkeleton key={i} delay={`${(i + 1) * 0.08}s`} showImage />)}
+        <CardSkeleton delay="0s" variant="lead" />
+        {[...Array(3)].map((_, i) => <CardSkeleton key={i} delay={`${(i + 1) * 0.08}s`} />)}
       </div>
     );
 
@@ -737,19 +817,70 @@ export function FeedScreen({
     );
 
 
-  if (clusters.length === 0)
+  if (clusters.length === 0) {
+    const emptyTitle = enabledPublisherCount === 0
+      ? t(lang, "noEnabledSources")
+      : rootView === "saved"
+        ? t(lang, "noSaved")
+        : rootView === "blindspots"
+          ? t(lang, "noBlindspots")
+        : activeCategory !== "all"
+          ? t(lang, "noStoriesForFilter")
+          : failedSources.length > 0
+            ? t(lang, "allSourcesFailed")
+            : t(lang, "noStories");
+    const emptySub = enabledPublisherCount === 0
+      ? t(lang, "noEnabledSourcesSub")
+      : rootView === "saved"
+        ? t(lang, "noSavedSub")
+        : rootView === "blindspots"
+          ? t(lang, "noBlindspotsSub")
+        : activeCategory !== "all"
+          ? t(lang, "noStoriesForFilterSub")
+          : failedSources.length > 0
+            ? t(lang, "allSourcesFailedSub")
+            : t(lang, "noStoriesSub");
+    const showRefresh = enabledPublisherCount > 0 && rootView === "feed" && activeCategory === "all";
     return (
-      <div className="empty-state">
-        <div className="empty-icon">
-          <svg width="32" height="32" viewBox="0 0 24 24" fill="none" stroke="var(--color-label-tertiary)" strokeWidth="1.5">
-            <rect x="3" y="3" width="7" height="7" rx="2" /><rect x="14" y="3" width="7" height="18" rx="2" /><rect x="3" y="14" width="7" height="7" rx="2" />
-          </svg>
+      <div className="feed-scroll">
+        <header className="feed-header">
+          <div>
+            <p className="feed-eyebrow">Merill</p>
+            <h1>{rootView === "saved" ? t(lang, "tabSaved") : rootView === "blindspots" ? t(lang, "tabBlindspots") : t(lang, "topStories")}</h1>
+          </div>
+        </header>
+        <div className="feed-scope segmented-control" role="group" aria-label={t(lang, "feedScope")}>
+          {(["local", "global"] as const).map(scope => (
+            <button key={scope} data-active={filter === scope} aria-pressed={filter === scope} onClick={() => onFilterChange(scope)}>
+              {t(lang, scope === "local" ? "tabLocal" : "tabGlobal")}
+            </button>
+          ))}
         </div>
-        <p className="empty-title">{t(lang, "noStories")}</p>
-        <p className="empty-sub">{t(lang, "fetchingNews")}</p>
-        <div className="spinner" />
+        <div className="empty-state with-feed-header">
+          <div className="empty-icon">
+            <svg width="32" height="32" viewBox="0 0 24 24" fill="none" stroke="var(--color-label-tertiary)" strokeWidth="1.5">
+              <rect x="3" y="3" width="7" height="7" rx="2" /><rect x="14" y="3" width="7" height="18" rx="2" /><rect x="3" y="14" width="7" height="7" rx="2" />
+            </svg>
+          </div>
+          <p className="empty-title">{emptyTitle}</p>
+          <p className="empty-sub">{emptySub}</p>
+          {enabledPublisherCount === 0 ? (
+            <button onClick={onOpenSettings} className="primary-btn">
+              {t(lang, "openSettings")}
+            </button>
+          ) : activeCategory !== "all" ? (
+            <button onClick={() => setActiveCategory("all")} className="primary-btn">
+              {t(lang, "clearFilter")}
+            </button>
+          ) : showRefresh && (
+            <button onClick={handleRefresh} className="primary-btn" disabled={isRefreshing}>
+              {isRefreshing ? t(lang, "refreshing") : t(lang, "refresh")}
+            </button>
+          )}
+        </div>
       </div>
     );
+  }
 
   return (
     <div ref={containerRef} className="feed-scroll">
@@ -778,16 +909,43 @@ export function FeedScreen({
         </div>
       )}
 
-      {/* Debug refresh button — desktop only */}
-      {typeof window !== "undefined" && !("ontouchstart" in window) && (
-        <button
-          onClick={handleRefresh}
-          disabled={isRefreshing}
-          style={{ margin: "8px 16px 0", padding: "6px 14px", borderRadius: 8, fontSize: 12,
-            background: "var(--color-accent)", color: "#fff", border: "none", opacity: isRefreshing ? 0.5 : 1 }}
-        >
-          {isRefreshing ? t(lang, "refreshing") : t(lang, "refresh")}
+      {refreshError && (
+        <div className="failed-sources-banner">
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round">
+            <circle cx="12" cy="12" r="10" /><path d="M12 8v4M12 16h.01" />
+          </svg>
+          {t(lang, "refreshError")}
+          <button className="banner-dismiss" onClick={() => setRefreshError(null)}>×</button>
+        </div>
+      )}
+
+      <header className="feed-header">
+        <div>
+          <p className="feed-eyebrow">Merill</p>
+          <h1>{rootView === "saved" ? t(lang, "tabSaved") : rootView === "blindspots" ? t(lang, "tabBlindspots") : t(lang, "topStories")}</h1>
+        </div>
+        <button className={`header-filter-btn${filtersOpen ? " active" : ""}`} onClick={() => setFiltersOpen(open => !open)} aria-label={t(lang, "filters")} aria-expanded={filtersOpen}>
+          <Filter size={18} />
         </button>
+      </header>
+      <div className="feed-scope segmented-control" role="group" aria-label={t(lang, "feedScope")}>
+        {(["local", "global"] as const).map(scope => (
+          <button key={scope} data-active={filter === scope} aria-pressed={filter === scope} onClick={() => onFilterChange(scope)}>
+            {t(lang, scope === "local" ? "tabLocal" : "tabGlobal")}
+          </button>
+        ))}
+      </div>
+      {filtersOpen && (
+        <div className="feed-filter-panel">
+          <span>{t(lang, "feedSort")}</span>
+          <div className="filter-options">
+            {([["balanced", "sortBalanced"], ["latest", "sortLatest"], ["covered", "sortCovered"]] as const).map(([value, label]) => (
+              <button key={value} data-active={feedSort === value} onClick={() => { setFeedSort(value); setFiltersOpen(false); }}>
+                {t(lang, label)} {feedSort === value && <Check size={15} />}
+              </button>
+            ))}
+          </div>
+        </div>
       )}
 
       {/* Category filter pills */}
@@ -797,6 +955,7 @@ export function FeedScreen({
             <button
               key={cat}
               className={`category-pill ${activeCategory === cat ? "active" : ""}`}
+              aria-pressed={activeCategory === cat}
               onClick={() => setActiveCategory(cat)}
             >
               {t(lang, CAT_I18N[cat])}
@@ -814,7 +973,9 @@ export function FeedScreen({
             <StoryCard
               cluster={c}
               onPress={onSelectCluster}
+              onDismiss={(id) => setDismissedIds(s => new Set(s).add(id))}
               animationDelay={`${Math.min(i * 0.05, 0.3)}s`}
+              variant={i === 0 ? "lead" : "compact"}
             />
           </SwipeToDismiss>
         ))}
@@ -835,7 +996,7 @@ function SourceRow({
   articleCount,
 }: {
   publisher: import("@/types").Publisher;
-  action: "remove" | "add" | "delete";
+  action: "toggle" | "delete";
   onAction: () => void;
   isLast: boolean;
   dimmed?: boolean;
@@ -875,11 +1036,12 @@ function SourceRow({
         </div>
       </div>
       <button
-        className={action === "add" ? "source-add-btn" : "source-remove-btn"}
+        className={action === "toggle" ? "source-toggle" : "source-delete-btn"}
         onClick={onAction}
-        aria-label={`${action} ${publisher.name}`}
+        aria-label={action === "toggle" ? `${publisher.name}: ${dimmed ? t(lang, "disabled") : t(lang, "enabled")}` : `${t(lang, "remove")} ${publisher.name}`}
+        aria-pressed={action === "toggle" ? !dimmed : undefined}
       >
-        {action === "add" ? "+" : "−"}
+        {action === "toggle" ? <span /> : <Trash2 size={16} />}
       </button>
     </div>
   );
@@ -911,7 +1073,7 @@ function SourcesSection({
             <SourceRow
               key={p.id}
               publisher={p}
-              action={onDelete ? "delete" : (enabled ? "remove" : "add")}
+              action={onDelete ? "delete" : "toggle"}
               onAction={() => onDelete ? onDelete(p.id) : onToggle(p.id)}
               isLast={i === sorted.length - 1}
               dimmed={!onDelete && !enabled}
@@ -926,7 +1088,7 @@ function SourcesSection({
 
 // ── Add Source Form ─────────────────────────────────────────────────────────
 
-function AddSourceForm({ isGlobal, onAdded }: { isGlobal: boolean; onAdded: () => void }) {
+function AddSourceForm({ isGlobal, onAdded }: { isGlobal: boolean; onAdded: () => void | Promise<void> }) {
   const lang = useAppStore(s => s.language);
   const [url, setUrl] = useState("");
   const [name, setName] = useState("");
@@ -943,9 +1105,9 @@ function AddSourceForm({ isGlobal, onAdded }: { isGlobal: boolean; onAdded: () =
       await addCustomPublisher(trimUrl, name.trim(), isGlobal);
       setUrl("");
       setName("");
-      onAdded();
+      await onAdded();
     } catch (err) {
-      setError(String(err));
+      setError(`${t(lang, "addSourceError")}: ${errorMessage(err)}`);
     } finally {
       setLoading(false);
     }
@@ -978,15 +1140,41 @@ function AddSourceForm({ isGlobal, onAdded }: { isGlobal: boolean; onAdded: () =
   );
 }
 
+function SettingsSection({
+  title,
+  open,
+  onToggle,
+  children,
+}: {
+  title: string;
+  open: boolean;
+  onToggle: () => void;
+  children: React.ReactNode;
+}) {
+  return (
+    <section className="settings-accordion">
+      <button className="settings-accordion-trigger" onClick={onToggle} aria-expanded={open}>
+        <span>{title}</span>
+        <ChevronDown size={18} className={open ? "open" : ""} />
+      </button>
+      {open && <div className="settings-accordion-body">{children}</div>}
+    </section>
+  );
+}
+
 // ── Settings Screen ─────────────────────────────────────────────────────────
 
 export function SettingsScreen() {
-  const { theme, setTheme, language, setLanguage, toggleLocalPublisher, toggleGlobalPublisher,
-    isLocalPublisherEnabled, isGlobalPublisherEnabled } = useAppStore();
+  const { theme, setTheme, language, setLanguage, toggleLocalPublisher, isLocalPublisherEnabled } = useAppStore();
   const queryClient = useQueryClient();
   const [reclustering, setReclustering] = useState(false);
   const [wiping, setWiping] = useState(false);
   const [wipeConfirm, setWipeConfirm] = useState(false);
+  const [settingsError, setSettingsError] = useState<string | null>(null);
+  const [settingsSuccess, setSettingsSuccess] = useState<string | null>(null);
+  const [openSection, setOpenSection] = useState<"appearance" | "sources" | "advanced" | "about">("appearance");
+  const [showLocalForm, setShowLocalForm] = useState(false);
+  const [showGlobalForm, setShowGlobalForm] = useState(false);
   const { data: publishers = [] } = usePublishers();
 
   const localPublishers = publishers.filter(p => !p.is_global).sort((a, b) => a.name.localeCompare(b.name));
@@ -1006,15 +1194,21 @@ export function SettingsScreen() {
 
   const invalidatePublishers = () => queryClient.invalidateQueries({ queryKey: ["publishers"] });
   const invalidateClusters = () => queryClient.invalidateQueries({ queryKey: clusterKeys.all() });
+  const invalidatePublisherData = async () => {
+    await invalidatePublishers();
+    await invalidateClusters();
+  };
 
   const handleDeleteCustom = async (id: string) => {
+    setSettingsError(null);
     try {
       await removeCustomPublisher(id);
-      invalidatePublishers();
       // Articles from this publisher are deleted from DB, so clusters must be re-fetched.
-      invalidateClusters();
+      await invalidatePublisherData();
+      setSettingsSuccess(t(language, "sourceRemoved"));
     } catch (e) {
       console.error("Failed to remove publisher:", e);
+      setSettingsError(t(language, "removeSourceError"));
     }
   };
 
@@ -1023,133 +1217,71 @@ export function SettingsScreen() {
     light: t(language, "light"),
     dark: t(language, "dark"),
   };
+  const toggleSection = (section: typeof openSection) => setOpenSection(current => current === section ? "about" : section);
+  const notifySourceAdded = async () => {
+    await invalidatePublisherData();
+    setSettingsSuccess(t(language, "sourceAdded"));
+    setShowLocalForm(false);
+    setShowGlobalForm(false);
+  };
 
   return (
     <div className="settings-page animate-fade-up">
-      {/* Appearance */}
-      <p className="settings-label">{t(language, "appearance")}</p>
-      <div className="segmented-control">
-        {(["system", "light", "dark"] as const).map(v => (
-          <button key={v} data-active={theme === v} onClick={() => setTheme(v)}>
-            {themeLabels[v]}
-          </button>
-        ))}
-      </div>
-
-      {/* Language */}
-      <p className="settings-label" style={{ marginTop: 28 }}>{t(language, "feedLanguage")}</p>
-      <div className="settings-group">
-        {([{ v: "en" as const, l: "English" }, { v: "mt" as const, l: "Malti" }]).map((opt, i) => (
-          <button key={opt.v} className="settings-row" onClick={() => setLanguage(opt.v)}
-            style={{ borderBottom: i === 0 ? "0.5px solid var(--color-separator)" : "none" }}>
-            <span className="settings-row-label">{opt.l}</span>
-            {language === opt.v && (
-              <svg width="20" height="20" viewBox="0 0 20 20" fill="none">
-                <circle cx="10" cy="10" r="10" fill="var(--color-accent)" />
-                <path d="M6 10l2.5 2.5L14 7.5" stroke="white" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" />
-              </svg>
-            )}
-          </button>
-        ))}
-      </div>
-
-      {/* Local Sources */}
-      <SourcesSection
-        label={t(language, "sourcesLocal")}
-        publishers={localPublishers}
-        isEnabled={isLocalPublisherEnabled}
-        onToggle={toggleLocalPublisher}
-        articleCounts={articleCounts}
-      />
-
-      {/* Add Malta Source */}
-      <p className="settings-label" style={{ marginTop: 28 }}>{t(language, "addMaltaSource")}</p>
-      <AddSourceForm isGlobal={false} onAdded={invalidatePublishers} />
-
-      {/* Global Sources */}
-      {globalPublishers.length > 0 && (
-        <>
-          <p className="settings-label" style={{ marginTop: 28 }}>{t(language, "sourcesGlobal")}</p>
-          <div className="settings-group">
-            {globalPublishers.map((p, i) => (
-              <SourceRow
-                key={p.id}
-                publisher={p}
-                action="delete"
-                onAction={() => handleDeleteCustom(p.id)}
-                isLast={i === globalPublishers.length - 1}
-                articleCount={articleCounts[p.id]}
-              />
-            ))}
-          </div>
-        </>
-      )}
-
-      {/* Add International Source */}
-      <p className="settings-label" style={{ marginTop: 28 }}>{t(language, "addInternationalSource")}</p>
-      <AddSourceForm isGlobal={true} onAdded={invalidatePublishers} />
-
-      {/* Re-cluster */}
-      <p className="settings-label" style={{ marginTop: 28 }}>{t(language, "forceRecluster")}</p>
-      <button
-        className="danger-btn"
-        disabled={reclustering}
-        onClick={async () => {
-          setReclustering(true);
-          try {
-            await forceRecluster();
-            queryClient.invalidateQueries({ queryKey: clusterKeys.all() });
-          } catch (e) { console.error(e); }
-          finally { setReclustering(false); }
-        }}
-      >
-        {reclustering ? t(language, "reclustering") : t(language, "forceRecluster")}
-      </button>
-
-      {/* Wipe All Data */}
-      <p className="settings-label" style={{ marginTop: 28 }}>{t(language, "wipeAllData")}</p>
-      {wipeConfirm ? (
-        <div className="settings-group">
-          <p style={{ padding: "12px 16px", fontSize: 14, color: "var(--color-text-secondary)" }}>
-            {t(language, "wipeAllDataConfirm")}
-          </p>
-          <div style={{ display: "flex", borderTop: "0.5px solid var(--color-separator)" }}>
-            <button
-              className="settings-row"
-              style={{ flex: 1, justifyContent: "center", color: "var(--color-text-secondary)" }}
-              onClick={() => setWipeConfirm(false)}
-            >
-              Cancel
-            </button>
-            <button
-              className="settings-row"
-              style={{ flex: 1, justifyContent: "center", color: "var(--color-destructive, #ff3b30)", borderLeft: "0.5px solid var(--color-separator)", fontWeight: 600 }}
-              disabled={wiping}
-              onClick={async () => {
-                setWiping(true);
-                try {
-                  await wipeAllData();
-                  queryClient.invalidateQueries({ queryKey: clusterKeys.all() });
-                } catch (e) { console.error(e); }
-                finally { setWiping(false); setWipeConfirm(false); }
-              }}
-            >
-              {wiping ? t(language, "wipingData") : t(language, "wipeAllData")}
-            </button>
-          </div>
+      <header className="settings-header">
+        <p className="feed-eyebrow">Merill</p>
+        <h1>{t(language, "settings")}</h1>
+      </header>
+      {settingsError && (
+        <div className="settings-error">
+          <span>{settingsError}</span>
+          <button onClick={() => setSettingsError(null)} aria-label="Dismiss">×</button>
         </div>
-      ) : (
-        <button className="danger-btn" onClick={() => setWipeConfirm(true)}>
-          {t(language, "wipeAllData")}
-        </button>
       )}
-
-      {/* About */}
-      <div className="settings-about">
-        <div className="app-icon lg"><img src="/app-icon.png" alt="Merill" /></div>
-        <p className="settings-app-name">Merill</p>
-        <p className="settings-version">v0.1.0</p>
-      </div>
+      {settingsSuccess && <div className="settings-success"><Check size={16} /><span>{settingsSuccess}</span><button onClick={() => setSettingsSuccess(null)} aria-label={t(language, "close")}><X size={16} /></button></div>}
+      <SettingsSection title={t(language, "appearance")} open={openSection === "appearance"} onToggle={() => toggleSection("appearance")}>
+        <p className="settings-label">{t(language, "appearance")}</p>
+        <div className="segmented-control">
+          {(["system", "light", "dark"] as const).map(v => <button key={v} data-active={theme === v} aria-pressed={theme === v} onClick={() => setTheme(v)}>{themeLabels[v]}</button>)}
+        </div>
+        <p className="settings-label settings-sub-label">{t(language, "feedLanguage")}</p>
+        <div className="segmented-control">
+          {([{ v: "en" as const, l: "English" }, { v: "mt" as const, l: "Malti" }]).map(opt => <button key={opt.v} data-active={language === opt.v} aria-pressed={language === opt.v} onClick={() => setLanguage(opt.v)}>{opt.l}</button>)}
+        </div>
+      </SettingsSection>
+      <SettingsSection title={t(language, "sources")} open={openSection === "sources"} onToggle={() => toggleSection("sources")}>
+        <SourcesSection label={t(language, "sourcesLocal")} publishers={localPublishers} isEnabled={isLocalPublisherEnabled} onToggle={toggleLocalPublisher} articleCounts={articleCounts} />
+        <button className="inline-add-trigger" onClick={() => setShowLocalForm(open => !open)}><Plus size={16} />{t(language, "addMaltaSource")}</button>
+        {showLocalForm && <AddSourceForm isGlobal={false} onAdded={notifySourceAdded} />}
+        <SourcesSection label={t(language, "sourcesGlobal")} publishers={globalPublishers} isEnabled={() => true} onToggle={() => undefined} onDelete={handleDeleteCustom} articleCounts={articleCounts} />
+        <button className="inline-add-trigger" onClick={() => setShowGlobalForm(open => !open)}><Plus size={16} />{t(language, "addInternationalSource")}</button>
+        {showGlobalForm && <AddSourceForm isGlobal onAdded={notifySourceAdded} />}
+      </SettingsSection>
+      <SettingsSection title={t(language, "advanced")} open={openSection === "advanced"} onToggle={() => toggleSection("advanced")}>
+        <p className="settings-note">{t(language, "advancedSub")}</p>
+        <button className="danger-btn quiet" disabled={reclustering} onClick={async () => {
+          setReclustering(true); setSettingsError(null);
+          try { await forceRecluster(); await invalidateClusters(); setSettingsSuccess(t(language, "reclusterSuccess")); }
+          catch (e) { console.error(e); setSettingsError(t(language, "reclusterError")); }
+          finally { setReclustering(false); }
+        }}>{reclustering ? t(language, "reclustering") : t(language, "forceRecluster")}</button>
+        {wipeConfirm ? (
+          <div className="settings-group wipe-confirm">
+            <p className="wipe-confirm-copy">{t(language, "wipeAllDataConfirm")}</p>
+            <div className="wipe-confirm-actions">
+              <button className="wipe-confirm-btn" onClick={() => setWipeConfirm(false)}>{t(language, "cancel")}</button>
+              <button className="wipe-confirm-btn danger" disabled={wiping} onClick={async () => {
+                setWiping(true); setSettingsError(null);
+                try { await wipeAllData(); await invalidateClusters(); setSettingsSuccess(t(language, "wipeSuccess")); }
+                catch (e) { console.error(e); setSettingsError(t(language, "wipeError")); }
+                finally { setWiping(false); setWipeConfirm(false); }
+              }}>{wiping ? t(language, "wipingData") : t(language, "wipeAllData")}</button>
+            </div>
+          </div>
+        ) : <button className="danger-btn" onClick={() => setWipeConfirm(true)}>{t(language, "wipeAllData")}</button>}
+      </SettingsSection>
+      <SettingsSection title={t(language, "about")} open={openSection === "about"} onToggle={() => toggleSection("about")}>
+        <div className="settings-about"><div className="app-icon lg"><img src="/app-icon.png" alt="Merill" /></div><p className="settings-app-name">Merill</p><p className="settings-version">v0.1.0</p></div>
+      </SettingsSection>
     </div>
   );
 }
