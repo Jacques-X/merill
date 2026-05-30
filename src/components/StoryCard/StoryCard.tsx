@@ -38,10 +38,9 @@ interface StoryCardProps {
   onPress?: (c: StoryCluster) => void;
   onDismiss?: (id: string) => void;
   animationDelay?: string;
-  variant?: "lead" | "compact";
 }
 
-export const StoryCard = memo(function StoryCard({ cluster, onPress, onDismiss, animationDelay = "0s", variant = "compact" }: StoryCardProps) {
+export const StoryCard = memo(function StoryCard({ cluster, onPress, onDismiss, animationDelay = "0s" }: StoryCardProps) {
   const lang = useAppStore(s => s.language);
   const biasOverrides = useAppStore(s => s.publisherBiasOverrides);
   const isSaved = useAppStore(s => s.isClusterSaved(cluster.id));
@@ -137,44 +136,11 @@ export const StoryCard = memo(function StoryCard({ cluster, onPress, onDismiss, 
     </button>
   );
 
-  if (variant === "compact") {
-    return (
-      <div
-        role="button"
-        tabIndex={0}
-        className="story-card compact animate-fade-up"
-        style={{ animationDelay }}
-        onClick={() => onPress?.(cluster)}
-        onKeyDown={(e) => {
-          if (e.key === "Enter" || e.key === " ") {
-            e.preventDefault();
-            onPress?.(cluster);
-          }
-        }}
-        aria-label={visibleHeadline}
-      >
-        <div className="compact-card-media" style={!imageUrl ? { background: `linear-gradient(135deg, ${placeholderColor}33, ${placeholderColor}11)` } : undefined}>
-          {imageUrl ? <img src={imageUrl} alt="" loading="lazy" onError={() => setImgError(true)} /> : <span>{t(lang, CATEGORY_I18N_KEYS[dominantCategory] ?? "catGeneral")}</span>}
-        </div>
-        <div className="compact-card-body">
-          <div className="compact-card-topline">
-            <span>{articles.length} {articles.length === 1 ? t(lang, "source") : t(lang, "sources")}</span>
-            <span>·</span>
-            <span>{timeAgo} {t(lang, "ago")}</span>
-          </div>
-          <h2 className="compact-card-headline">{visibleHeadline}</h2>
-          <BiasBar coverage={coverage} compact />
-        </div>
-        <div className="compact-card-save" onClick={stopCardAction}>{saveButton}</div>
-      </div>
-    );
-  }
-
   return (
     <div
       role="button"
       tabIndex={0}
-      className="story-card lead animate-fade-up"
+      className="story-card animate-fade-up"
       style={{ animationDelay }}
       onClick={() => onPress?.(cluster)}
       onKeyDown={(e) => {

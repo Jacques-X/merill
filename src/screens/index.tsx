@@ -609,19 +609,7 @@ export function StoryDetailScreen({
 
 // ── Skeletons ────────────────────────────────────────────────────────────────
 
-function CardSkeleton({ delay = "0s", variant = "compact" }: { delay?: string; variant?: "lead" | "compact" }) {
-  if (variant === "compact") {
-    return (
-      <div className="story-card compact skeleton-card animate-fade-up" style={{ animationDelay: delay }}>
-        <div className="skeleton compact-card-media" />
-        <div className="compact-card-body">
-          <div className="skeleton" style={{ height: 10, width: "45%" }} />
-          <div className="skeleton" style={{ height: 15, width: "94%" }} />
-          <div className="skeleton" style={{ height: 15, width: "70%" }} />
-        </div>
-      </div>
-    );
-  }
+function CardSkeleton({ delay = "0s" }: { delay?: string }) {
   return (
     <div className="story-card skeleton-card animate-fade-up" style={{ animationDelay: delay }}>
       <div className="skeleton" style={{ width: "100%", height: 200, borderRadius: 0 }} />
@@ -797,8 +785,7 @@ export function FeedScreen({
   if (isLoading || publishersLoading || (isRefreshing && rawClusters.length === 0))
     return (
       <div className="feed-list">
-        <CardSkeleton delay="0s" variant="lead" />
-        {[...Array(3)].map((_, i) => <CardSkeleton key={i} delay={`${(i + 1) * 0.08}s`} />)}
+        {[...Array(3)].map((_, i) => <CardSkeleton key={i} delay={`${i * 0.08}s`} />)}
       </div>
     );
 
@@ -975,7 +962,6 @@ export function FeedScreen({
               onPress={onSelectCluster}
               onDismiss={(id) => setDismissedIds(s => new Set(s).add(id))}
               animationDelay={`${Math.min(i * 0.05, 0.3)}s`}
-              variant={i === 0 ? "lead" : "compact"}
             />
           </SwipeToDismiss>
         ))}
