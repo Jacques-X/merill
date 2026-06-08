@@ -14,9 +14,9 @@
             buildForAnalyzing = "YES">
             <BuildableReference
                BuildableIdentifier = "primary"
-               BlueprintIdentifier = "00E92BD7B1B3EC6FE402B6D4"
+               BlueprintIdentifier = "7205511AD72B7EBDFA16402D"
                BuildableName = "Merill.app"
-               BlueprintName = "app_iOS"
+               BlueprintName = "app_macOS"
                ReferencedContainer = "container:merill.xcodeproj">
             </BuildableReference>
          </BuildActionEntry>
@@ -30,9 +30,9 @@
       <MacroExpansion>
          <BuildableReference
             BuildableIdentifier = "primary"
-            BlueprintIdentifier = "00E92BD7B1B3EC6FE402B6D4"
+            BlueprintIdentifier = "7205511AD72B7EBDFA16402D"
             BuildableName = "Merill.app"
-            BlueprintName = "app_iOS"
+            BlueprintName = "app_macOS"
             ReferencedContainer = "container:merill.xcodeproj">
          </BuildableReference>
       </MacroExpansion>
@@ -65,9 +65,9 @@
          runnableDebuggingMode = "0">
          <BuildableReference
             BuildableIdentifier = "primary"
-            BlueprintIdentifier = "00E92BD7B1B3EC6FE402B6D4"
+            BlueprintIdentifier = "7205511AD72B7EBDFA16402D"
             BuildableName = "Merill.app"
-            BlueprintName = "app_iOS"
+            BlueprintName = "app_macOS"
             ReferencedContainer = "container:merill.xcodeproj">
          </BuildableReference>
       </BuildableProductRunnable>
@@ -94,9 +94,9 @@
          runnableDebuggingMode = "0">
          <BuildableReference
             BuildableIdentifier = "primary"
-            BlueprintIdentifier = "00E92BD7B1B3EC6FE402B6D4"
+            BlueprintIdentifier = "7205511AD72B7EBDFA16402D"
             BuildableName = "Merill.app"
-            BlueprintName = "app_iOS"
+            BlueprintName = "app_macOS"
             ReferencedContainer = "container:merill.xcodeproj">
          </BuildableReference>
       </BuildableProductRunnable>

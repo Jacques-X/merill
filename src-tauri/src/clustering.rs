@@ -779,29 +779,53 @@ fn has_specific_numeric_phrase(anchors: &[String]) -> bool {
     })
 }
 
+fn has_non_numeric_anchor(anchors: &[String]) -> bool {
+    anchors
+        .iter()
+        .any(|anchor| anchor.split('_').any(|part| !is_numeric_anchor(part)))
+}
+
 fn evidence_failure(
     relation: CategoryRelation,
+    shared_token_count: usize,
     shared_anchor_count: usize,
     has_numeric_phrase: bool,
+    has_non_numeric_anchor: bool,
     same_publisher: bool,
     has_clear_category_majority: bool,
 ) -> Option<&'static str> {
-    if shared_anchor_count < 2 && !has_numeric_phrase {
-        return Some("needs-two-independent-anchors");
-    }
-
-    if !has_clear_category_majority && shared_anchor_count < 2 {
-        return Some("mixed-cluster-needs-two-anchors");
-    }
-
     if same_publisher && shared_anchor_count < 2 && !has_numeric_phrase {
         return Some("same-publisher-needs-two-anchors");
     }
 
+    if !has_clear_category_majority && shared_anchor_count < 2 && !has_numeric_phrase {
+        return Some("mixed-cluster-needs-two-anchors");
+    }
+
     match relation {
-        CategoryRelation::Same => None,
-        CategoryRelation::Unknown => None,
-        CategoryRelation::Cross => None,
+        CategoryRelation::Same => {
+            if !has_non_numeric_anchor && !has_numeric_phrase {
+                Some("same-category-needs-strong-anchor")
+            } else if shared_token_count < MIN_SHARED_TOKENS {
+                Some("same-category-needs-token-support")
+            } else {
+                None
+            }
+        }
+        CategoryRelation::Unknown => {
+            if shared_anchor_count < 2 && !has_numeric_phrase {
+                Some("unknown-category-needs-two-anchors")
+            } else {
+                None
+            }
+        }
+        CategoryRelation::Cross => {
+            if shared_anchor_count < 2 && !has_numeric_phrase {
+                Some("cross-category-needs-two-anchors")
+            } else {
+                None
+            }
+        }
     }
 }
 
@@ -850,6 +874,7 @@ pub fn assign_cluster(
         let aggregate = aggregate_tokens(data);
         let shared_anchors = shared_anchor_words(&article_tokens, &aggregate);
         let has_numeric_phrase = has_specific_numeric_phrase(&shared_anchors);
+        let has_non_numeric_anchor = has_non_numeric_anchor(&shared_anchors);
         if shared_count < MIN_SHARED_TOKENS && shared_anchors.is_empty() {
             continue;
         }
@@ -871,8 +896,10 @@ pub fn assign_cluster(
 
         if let Some(reason) = evidence_failure(
             relation,
+            shared_count,
             shared_anchors.len(),
             has_numeric_phrase,
+            has_non_numeric_anchor,
             same_publisher,
             clear_majority,
         ) {
@@ -1051,14 +1078,17 @@ pub fn find_cluster_merges(
             let agg_b = aggregate_tokens(data_b);
             let shared_anchors = shared_anchor_words(&agg_a, &agg_b);
             let has_numeric_phrase = has_specific_numeric_phrase(&shared_anchors);
+            let has_non_numeric_anchor = has_non_numeric_anchor(&shared_anchors);
             let relation = category_relation(
                 data_a.category.as_deref().unwrap_or("general"),
                 data_b.category.as_deref(),
             );
             if let Some(reason) = evidence_failure(
                 relation,
+                shared_count,
                 shared_anchors.len(),
                 has_numeric_phrase,
+                has_non_numeric_anchor,
                 false,
                 cluster_has_clear_category_majority(data_a)
                     && cluster_has_clear_category_majority(data_b),
@@ -1296,6 +1326,36 @@ mod tests {
             "These are the PN candidates for the 10th District",
             "politics",
             "politics",
+        );
+    }
+
+    #[test]
+    fn same_category_cross_publisher_match_can_use_one_strong_phrase() {
+        assert_joins(
+            "Mosta residents oppose Zokrija tower application",
+            "Zokrija tower application draws protest from Mosta residents",
+            "local",
+            "local",
+        );
+    }
+
+    #[test]
+    fn unknown_category_still_needs_two_independent_anchors() {
+        assert_does_not_join(
+            "Mosta residents oppose Zokrija tower application",
+            "Zokrija tower plans discussed by developers",
+            "general",
+            "local",
+        );
+    }
+
+    #[test]
+    fn cross_category_still_needs_two_independent_anchors() {
+        assert_does_not_join(
+            "Mosta residents oppose Zokrija tower application",
+            "Zokrija tower company posts annual profits",
+            "local",
+            "business",
         );
     }
 

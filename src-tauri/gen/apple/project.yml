@@ -1,8 +1,9 @@
-name: app
+name: merill
 options:
   bundleIdPrefix: mt.merill.app
   deploymentTarget:
     iOS: 16.0
+    macOS: 13.0
 
 packages:
   swift-transformers:
@@ -17,6 +18,7 @@ settingGroups:
     base:
       PRODUCT_NAME: Merill
       PRODUCT_BUNDLE_IDENTIFIER: mt.merill.app
+      DEVELOPMENT_TEAM: M6N9VADU7W
 targetTemplates:
   app:
     type: application
@@ -33,16 +35,19 @@ targets:
     type: application
     platform: iOS
     sources:
-      - path: Sources
+      - path: Sources/Native
+      - path: Sources/AISummary.swift
       - path: Assets.xcassets
       - path: Externals
-      - path: app_iOS
+        excludes:
+          - "**/*.a"
+      - path: merill_iOS
       - path: assets
         buildPhase: resources
         type: folder
       - path: LaunchScreen.storyboard
     info:
-      path: app_iOS/Info.plist
+      path: merill_iOS/Info.plist
       properties:
         LSRequiresIPhoneOS: true
         UILaunchStoryboardName: LaunchScreen
@@ -59,7 +64,7 @@ targets:
         CFBundleShortVersionString: 0.1.0
         CFBundleVersion: "0.1.0"
     entitlements:
-      path: app_iOS/app_iOS.entitlements
+      path: merill_iOS/merill_iOS.entitlements
     scheme:
       environmentVariables:
         RUST_BACKTRACE: full
@@ -72,6 +77,7 @@ targets:
         LIBRARY_SEARCH_PATHS[arch=x86_64]: $(inherited) $(PROJECT_DIR)/Externals/x86_64/$(CONFIGURATION) $(SDKROOT)/usr/lib/swift $(TOOLCHAIN_DIR)/usr/lib/swift/$(PLATFORM_NAME) $(TOOLCHAIN_DIR)/usr/lib/swift-5.0/$(PLATFORM_NAME)
         LIBRARY_SEARCH_PATHS[arch=arm64]: $(inherited) $(PROJECT_DIR)/Externals/arm64/$(CONFIGURATION) $(SDKROOT)/usr/lib/swift $(TOOLCHAIN_DIR)/usr/lib/swift/$(PLATFORM_NAME) $(TOOLCHAIN_DIR)/usr/lib/swift-5.0/$(PLATFORM_NAME)
         ALWAYS_EMBED_SWIFT_STANDARD_LIBRARIES: true
+        SWIFT_OBJC_BRIDGING_HEADER: Sources/app/bindings/bindings.h
         EXCLUDED_ARCHS[sdk=iphoneos*]: x86_64
       groups: [app]
     dependencies:
@@ -86,7 +92,7 @@ targets:
       - sdk: UIKit.framework
       - sdk: WebKit.framework
       - package: swift-transformers
-        product: Tokenizers
+        product: Transformers
     preBuildScripts:
       - script: npm run -- tauri ios xcode-script -v --platform ${PLATFORM_DISPLAY_NAME:?} --sdk-root ${SDKROOT:?} --framework-search-paths "${FRAMEWORK_SEARCH_PATHS:?}" --header-search-paths "${HEADER_SEARCH_PATHS:?}" --gcc-preprocessor-definitions "${GCC_PREPROCESSOR_DEFINITIONS:-}" --configuration ${CONFIGURATION:?} ${FORCE_COLOR} ${ARCHS:?}
         name: Build Rust Code
@@ -94,3 +100,29 @@ targets:
         outputFiles:
           - $(SRCROOT)/Externals/x86_64/${CONFIGURATION}/libapp.a
           - $(SRCROOT)/Externals/arm64/${CONFIGURATION}/libapp.a
+  app_macOS:
+    type: application
+    platform: macOS
+    sources:
+      - path: Sources/Native
+      - path: Assets.xcassets
+    info:
+      path: app_macOS/Info.plist
+      properties:
+        CFBundleShortVersionString: 0.1.0
+        CFBundleVersion: "0.1.0"
+    scheme:
+      environmentVariables:
+        RUST_BACKTRACE: full
+        RUST_LOG: info
+    settings:
+      base:
+        SWIFT_OBJC_BRIDGING_HEADER: Sources/app/bindings/bindings.h
+        OTHER_LDFLAGS: $(inherited) $(PROJECT_DIR)/../../target/debug/libapp_lib.a
+      groups: [app]
+    preBuildScripts:
+      - script: cd ../.. && cargo build
+        name: Build Rust Code
+        basedOnDependencyAnalysis: false
+        outputFiles:
+          - $(SRCROOT)/../../target/debug/libapp_lib.a

@@ -1,5 +1,6 @@
 import Foundation
 import CoreML
+import Hub
 
 // T5 tokenisation via HuggingFace swift-transformers (SPM dependency).
 // Handles SentencePiece vocabularies used by flan-t5-small.
@@ -57,7 +58,7 @@ private final class T5SummaryEngine {
 
     private let encoder:   MLModel
     private let decoder:   MLModel
-    private let tokenizer: any TextTokenizer
+    private let tokenizer: any Tokenizer
     private let eosId:     Int
     private let padId:     Int
 
@@ -82,14 +83,14 @@ private final class T5SummaryEngine {
             tokenizerData:   config(from: tokURL, file: "tokenizer.json")
         )
         eosId = tokenizer.eosTokenId ?? 1
-        padId = tokenizer.padTokenId ?? 0
+        padId = tokenizer.convertTokenToId("<pad>") ?? 0
     }
 
     // ── Generate text for a single prompt ────────────────────────────────────
 
     func generate(prompt: String, maxTokens: Int) throws -> String {
         // 1. Tokenise + pad to kMaxInput
-        let rawIds  = tokenizer(prompt).inputIds
+        let rawIds  = tokenizer(prompt)
         let clipLen = min(rawIds.count, kMaxInput)
 
         var inputIds = [Int32](repeating: Int32(padId), count: kMaxInput)
@@ -168,8 +169,7 @@ private func modelURL(_ name: String) -> URL? {
 // Load a JSON file from a bundle directory into a swift-transformers Config.
 private func config(from folder: URL, file: String) throws -> Config {
     let data = try Data(contentsOf: folder.appendingPathComponent(file))
-    let json = try JSONSerialization.jsonObject(with: data) as! [String: Any]
-    return Config(json)
+    return try JSONDecoder().decode(Config.self, from: data)
 }
 
 private func argmax(_ arr: MLMultiArray) -> Int {

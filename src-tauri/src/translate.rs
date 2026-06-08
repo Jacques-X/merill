@@ -33,6 +33,63 @@ pub async fn translate_text(client: &reqwest::Client, text: &str, from: &str, to
     Err(last_err.unwrap())
 }
 
+/// Translate longer prose without exceeding practical query-string limits.
+/// Paragraph boundaries are preserved where possible so article text remains readable.
+pub async fn translate_long_text(
+    client: &reqwest::Client,
+    text: &str,
+    from: &str,
+    to: &str,
+) -> Result<String> {
+    const MAX_CHARS: usize = 2_000;
+    if text.chars().count() <= MAX_CHARS {
+        return translate_text(client, text, from, to).await;
+    }
+
+    let mut chunks = Vec::new();
+    let mut current = String::new();
+    for paragraph in text.split("\n\n") {
+        if paragraph.chars().count() > MAX_CHARS {
+            if !current.is_empty() {
+                chunks.push(std::mem::take(&mut current));
+            }
+            let mut part = String::new();
+            for word in paragraph.split_whitespace() {
+                let addition = word.chars().count() + usize::from(!part.is_empty());
+                if part.chars().count() + addition > MAX_CHARS && !part.is_empty() {
+                    chunks.push(std::mem::take(&mut part));
+                }
+                if !part.is_empty() {
+                    part.push(' ');
+                }
+                part.push_str(word);
+            }
+            if !part.is_empty() {
+                chunks.push(part);
+            }
+            continue;
+        }
+
+        let separator = if current.is_empty() { 0 } else { 2 };
+        if current.chars().count() + separator + paragraph.chars().count() > MAX_CHARS {
+            chunks.push(std::mem::take(&mut current));
+        }
+        if !current.is_empty() {
+            current.push_str("\n\n");
+        }
+        current.push_str(paragraph);
+    }
+    if !current.is_empty() {
+        chunks.push(current);
+    }
+
+    let mut translated = Vec::with_capacity(chunks.len());
+    for chunk in chunks {
+        translated.push(translate_text(client, &chunk, from, to).await?);
+    }
+    Ok(translated.join("\n\n"))
+}
+
 async fn try_translate(client: &reqwest::Client, text: &str, from: &str, to: &str) -> Result<String> {
     let resp = client
         .get("https://translate.googleapis.com/translate_a/single")

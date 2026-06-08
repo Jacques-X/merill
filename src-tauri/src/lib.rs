@@ -2,6 +2,7 @@ mod category;
 mod clustering;
 mod db;
 mod models;
+mod native_bridge;
 mod pipeline;
 mod publishers;
 mod scraper;
@@ -10,28 +11,34 @@ mod translate;
 // ── iOS Foundation Models bridge ────────────────────────────────────────────
 #[cfg(target_os = "ios")]
 mod ios_ai {
-    use std::ffi::{CStr, CString, c_char};
+    use std::ffi::{CStr, CString, c_char, c_void};
 
     extern "C" {
-        /// Implemented in AISummary.swift via @_cdecl.
-        /// inputJson  – UTF-8 JSON: {"headlines":["..."],"snippets":["..."]}
-        /// outputBuf  – caller-allocated buffer; receives UTF-8 JSON: {"headline":"...","summary":"..."}
-        /// bufLen     – size of outputBuf in bytes
-        /// Returns true on success.
-        fn merill_generate_summary(
-            input_json: *const c_char,
-            output_buf: *mut c_char,
-            buf_len:    i32,
-        ) -> bool;
+        fn dlsym(handle: *mut c_void, symbol: *const c_char) -> *mut c_void;
+    }
+
+    type GenerateSummaryFn =
+        unsafe extern "C" fn(*const c_char, *mut c_char, i32) -> bool;
+
+    fn generate_summary_fn() -> Option<GenerateSummaryFn> {
+        let symbol = CString::new("merill_generate_summary").ok()?;
+        // RTLD_DEFAULT searches symbols already loaded into the app process.
+        let address = unsafe { dlsym((-2isize) as *mut c_void, symbol.as_ptr()) };
+        if address.is_null() {
+            None
+        } else {
+            Some(unsafe { std::mem::transmute::<*mut c_void, GenerateSummaryFn>(address) })
+        }
     }
 
     pub fn generate(headlines: &[String], snippets: &[String]) -> Option<(String, String)> {
+        let generate_summary = generate_summary_fn()?;
         let input = serde_json::json!({ "headlines": headlines, "snippets": snippets });
         let c_input = CString::new(input.to_string()).ok()?;
         let mut buf = vec![0i8; 32768];
 
         let ok = unsafe {
-            merill_generate_summary(c_input.as_ptr(), buf.as_mut_ptr(), buf.len() as i32)
+            generate_summary(c_input.as_ptr(), buf.as_mut_ptr(), buf.len() as i32)
         };
         if !ok { return None; }
 
@@ -59,6 +66,7 @@ fn generate_summary_impl(headlines: &[String], snippets: &[String]) -> (String, 
 
 use r2d2::Pool;
 use r2d2_sqlite::SqliteConnectionManager;
+use std::path::Path;
 use std::sync::{Mutex, OnceLock};
 use std::time::Instant;
 use tauri::Manager;
@@ -84,16 +92,44 @@ use publishers::publisher_info;
 /// "refresh" just re-reads the DB (re-ordering cards) without hitting the network.
 const SCRAPE_COOLDOWN_SECS: u64 = 5 * 60;
 
-struct AppState {
+pub(crate) struct MerillCore {
     db: DbPool,
     last_scraped: Mutex<Option<Instant>>,
 }
 
+impl MerillCore {
+    pub(crate) fn open(db_path: &Path) -> Result<Self, String> {
+        if let Some(parent) = db_path.parent() {
+            std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+        }
+        log::info!("database at {}", db_path.display());
+
+        {
+            let init_conn = db::open(db_path).map_err(|e| e.to_string())?;
+            match db::prune_old_articles(&init_conn, 7) {
+                Ok(n) => log::info!("pruned {} old articles", n),
+                Err(e) => log::warn!("pruning failed: {}", e),
+            }
+        }
+
+        let manager = r2d2_sqlite::SqliteConnectionManager::file(db_path)
+            .with_init(db::setup_pragmas);
+        let db = r2d2::Pool::builder()
+            .max_size(5)
+            .build(manager)
+            .map_err(|e| e.to_string())?;
+
+        Ok(Self {
+            db,
+            last_scraped: Mutex::new(None),
+        })
+    }
+}
+
 // ── Tauri Commands ──────────────────────────────────────────────────────────
 
-#[tauri::command]
-async fn get_clusters(
-    state: tauri::State<'_, AppState>,
+pub(crate) async fn get_clusters_core(
+    state: &MerillCore,
     blindspots_only: bool,
 ) -> Result<ClustersResponse, String> {
     let conn = state.db.get().map_err(|e| e.to_string())?;
@@ -165,7 +201,14 @@ async fn get_clusters(
 }
 
 #[tauri::command]
-async fn refresh_feed(state: tauri::State<'_, AppState>) -> Result<RefreshResult, String> {
+async fn get_clusters(
+    state: tauri::State<'_, MerillCore>,
+    blindspots_only: bool,
+) -> Result<ClustersResponse, String> {
+    get_clusters_core(&state, blindspots_only).await
+}
+
+pub(crate) async fn refresh_feed_core(state: &MerillCore) -> Result<RefreshResult, String> {
     {
         let last = state.last_scraped.lock().unwrap();
         if let Some(ts) = *last {
@@ -201,8 +244,12 @@ async fn refresh_feed(state: tauri::State<'_, AppState>) -> Result<RefreshResult
 }
 
 #[tauri::command]
-async fn fetch_article_body(
-    state: tauri::State<'_, AppState>,
+async fn refresh_feed(state: tauri::State<'_, MerillCore>) -> Result<RefreshResult, String> {
+    refresh_feed_core(&state).await
+}
+
+pub(crate) async fn fetch_article_body_core(
+    state: &MerillCore,
     article_id: String,
     url: String,
 ) -> Result<models::ArticleBody, String> {
@@ -268,8 +315,17 @@ async fn fetch_article_body(
     })
 }
 
+#[tauri::command]
+async fn fetch_article_body(
+    state: tauri::State<'_, MerillCore>,
+    article_id: String,
+    url: String,
+) -> Result<models::ArticleBody, String> {
+    fetch_article_body_core(&state, article_id, url).await
+}
+
 #[derive(serde::Serialize)]
-struct SummaryResult {
+pub(crate) struct SummaryResult {
     headline: String,
     summary: String,
 }
@@ -277,9 +333,8 @@ struct SummaryResult {
 /// Generate (or return cached) AI headline + summary for a cluster.
 /// On iOS 26+ uses Foundation Models; on other platforms returns the
 /// best existing headline and first non-empty snippet.
-#[tauri::command]
-async fn generate_cluster_summary(
-    state: tauri::State<'_, AppState>,
+pub(crate) async fn generate_cluster_summary_core(
+    state: &MerillCore,
     cluster_id: String,
     headlines: Vec<String>,
     snippets: Vec<String>,
@@ -317,7 +372,16 @@ async fn generate_cluster_summary(
 }
 
 #[tauri::command]
-fn get_publishers(state: tauri::State<'_, AppState>) -> Vec<models::PublisherInfo> {
+async fn generate_cluster_summary(
+    state: tauri::State<'_, MerillCore>,
+    cluster_id: String,
+    headlines: Vec<String>,
+    snippets: Vec<String>,
+) -> Result<SummaryResult, String> {
+    generate_cluster_summary_core(&state, cluster_id, headlines, snippets).await
+}
+
+pub(crate) fn get_publishers_core(state: &MerillCore) -> Vec<models::PublisherInfo> {
     let mut list: Vec<models::PublisherInfo> = publishers::all_publisher_defs()
         .iter()
         .map(|p| publishers::publisher_info(p.id))
@@ -340,8 +404,12 @@ fn get_publishers(state: tauri::State<'_, AppState>) -> Vec<models::PublisherInf
 }
 
 #[tauri::command]
-async fn add_custom_publisher(
-    state: tauri::State<'_, AppState>,
+fn get_publishers(state: tauri::State<'_, MerillCore>) -> Vec<models::PublisherInfo> {
+    get_publishers_core(&state)
+}
+
+pub(crate) async fn add_custom_publisher_core(
+    state: &MerillCore,
     url: String,
     name: String,
     is_global: bool,
@@ -453,6 +521,16 @@ async fn add_custom_publisher(
         logo_url: favicon_from_url(&final_url),
         is_global,
     })
+}
+
+#[tauri::command]
+async fn add_custom_publisher(
+    state: tauri::State<'_, MerillCore>,
+    url: String,
+    name: String,
+    is_global: bool,
+) -> Result<models::PublisherInfo, String> {
+    add_custom_publisher_core(&state, url, name, is_global).await
 }
 
 /// Derive a favicon URL from any URL by keeping only the scheme + host.
@@ -596,9 +674,8 @@ fn extract_attr(tag: &str, attr: &str) -> Option<String> {
 
 /// Move a single article to its own new cluster (user-initiated split).
 /// Returns the new cluster_id so the frontend can optimistically remove the row.
-#[tauri::command]
-async fn split_cluster(
-    state: tauri::State<'_, AppState>,
+pub(crate) async fn split_cluster_core(
+    state: &MerillCore,
     article_id: String,
     headline: String,
     published_at: String,
@@ -610,18 +687,31 @@ async fn split_cluster(
     Ok(new_cluster_id)
 }
 
-/// Delete all articles and clusters and reset the scrape cooldown.
 #[tauri::command]
-fn wipe_all_data(state: tauri::State<'_, AppState>) -> Result<(), String> {
+async fn split_cluster(
+    state: tauri::State<'_, MerillCore>,
+    article_id: String,
+    headline: String,
+    published_at: String,
+) -> Result<String, String> {
+    split_cluster_core(&state, article_id, headline, published_at).await
+}
+
+/// Delete all articles and clusters and reset the scrape cooldown.
+pub(crate) fn wipe_all_data_core(state: &MerillCore) -> Result<(), String> {
     let conn = state.db.get().map_err(|e| e.to_string())?;
     db::wipe_all_data(&conn).map_err(|e| e.to_string())?;
     *state.last_scraped.lock().unwrap() = None;
     Ok(())
 }
 
-/// Wipe all cluster assignments and re-cluster every article in the DB from scratch.
 #[tauri::command]
-fn force_recluster(state: tauri::State<'_, AppState>) -> Result<String, String> {
+fn wipe_all_data(state: tauri::State<'_, MerillCore>) -> Result<(), String> {
+    wipe_all_data_core(&state)
+}
+
+/// Wipe all cluster assignments and re-cluster every article in the DB from scratch.
+pub(crate) fn force_recluster_core(state: &MerillCore) -> Result<String, String> {
     // Reset scrape cooldown so a subsequent normal refresh also runs.
     *state.last_scraped.lock().unwrap() = None;
     let result = pipeline::recluster_all(&state.db).map_err(|e| e.to_string())?;
@@ -629,8 +719,12 @@ fn force_recluster(state: tauri::State<'_, AppState>) -> Result<String, String> 
 }
 
 #[tauri::command]
-fn remove_custom_publisher(
-    state: tauri::State<'_, AppState>,
+fn force_recluster(state: tauri::State<'_, MerillCore>) -> Result<String, String> {
+    force_recluster_core(&state)
+}
+
+pub(crate) fn remove_custom_publisher_core(
+    state: &MerillCore,
     id: String,
 ) -> Result<(), String> {
     let conn = state.db.get().map_err(|e| e.to_string())?;
@@ -638,11 +732,23 @@ fn remove_custom_publisher(
 }
 
 #[tauri::command]
-async fn translate_summary(text: String, to: String) -> Result<String, String> {
+fn remove_custom_publisher(
+    state: tauri::State<'_, MerillCore>,
+    id: String,
+) -> Result<(), String> {
+    remove_custom_publisher_core(&state, id)
+}
+
+pub(crate) async fn translate_summary_core(text: String, to: String) -> Result<String, String> {
     let from = if to == "mt" { "en" } else { "mt" };
-    translate::translate_text(http_client(), &text, from, &to)
+    translate::translate_long_text(http_client(), &text, from, &to)
         .await
         .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn translate_summary(text: String, to: String) -> Result<String, String> {
+    translate_summary_core(text, to).await
 }
 
 // ── App Setup ───────────────────────────────────────────────────────────────
@@ -663,32 +769,8 @@ pub fn run() {
                 .path()
                 .app_data_dir()
                 .expect("failed to resolve app data dir");
-            std::fs::create_dir_all(&data_dir).ok();
             let db_path = data_dir.join("merill.db");
-            log::info!("database at {}", db_path.display());
-
-            // Run migrations once with a dedicated connection, then drop it.
-            {
-                let init_conn = db::open(&db_path).expect("failed to open database");
-                match db::prune_old_articles(&init_conn, 7) {
-                    Ok(n) => log::info!("pruned {} old articles", n),
-                    Err(e) => log::warn!("pruning failed: {}", e),
-                }
-            }
-
-            // Create the connection pool. WAL mode (already in migrations) allows
-            // concurrent readers while the pipeline holds its write connection.
-            let manager = r2d2_sqlite::SqliteConnectionManager::file(&db_path)
-                .with_init(db::setup_pragmas);
-            let pool = r2d2::Pool::builder()
-                .max_size(5)
-                .build(manager)
-                .expect("failed to create connection pool");
-
-            app.manage(AppState {
-                db: pool,
-                last_scraped: Mutex::new(None),
-            });
+            app.manage(MerillCore::open(&db_path).expect("failed to open database"));
 
             Ok(())
         })
