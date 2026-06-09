@@ -1,0 +1,74 @@
+[
+  {
+    "label": true,
+    "left": "Maltese film Żejtune has its North American premiere",
+    "right": "Maltese Film Żejtune Premieres At Tribeca Film Festival In New York",
+    "category": "entertainment"
+  },
+  {
+    "label": true,
+    "left": "Il-film Żejtune jagħmel il-premiere tiegħu fi New York",
+    "right": "Żejtune celebrated its North American premiere at Tribeca",
+    "category": "entertainment"
+  },
+  {
+    "label": true,
+    "left": "Tower crane drops concrete slab onto car in St Julians",
+    "right": "Woman injured after concrete slab falls from tower crane in St Julians",
+    "category": "local"
+  },
+  {
+    "label": true,
+    "left": "Gas tanker truck crushes vehicle in Birżebbuġa",
+    "right": "Two trucks and gas tanker involved in Birżebbuġa collision",
+    "category": "local"
+  },
+  {
+    "label": true,
+    "left": "Residents object to proposed Zokrija tower in Mosta",
+    "right": "Mosta community files objections against Zokrija high-rise application",
+    "category": "local"
+  },
+  {
+    "label": true,
+    "left": "Government announces €12 million Marsaskala school project",
+    "right": "New school in Marsaskala to receive twelve million euro investment",
+    "category": "local"
+  },
+  {
+    "label": false,
+    "left": "Robert Abela unveils Labour economic proposals",
+    "right": "BCA board member linked to Robert Abela hotel project",
+    "category": "politics"
+  },
+  {
+    "label": false,
+    "left": "PN publishes candidates for the 4th District",
+    "right": "PN publishes candidates for the 10th District",
+    "category": "politics"
+  },
+  {
+    "label": false,
+    "left": "Mosta residents oppose Zokrija tower application",
+    "right": "Zokrija Holdings reports higher annual profits",
+    "category": "business"
+  },
+  {
+    "label": false,
+    "left": "Tower crane drops concrete slab onto car in St Julians",
+    "right": "Gas tanker involved in collision in Birżebbuġa",
+    "category": "local"
+  },
+  {
+    "label": false,
+    "left": "Maltese film Żejtune premieres at Tribeca",
+    "right": "Maltese film Luzzu returns to cinemas after festival success",
+    "category": "entertainment"
+  },
+  {
+    "label": false,
+    "left": "Court hears challenge to hospitals concession",
+    "right": "Court jails man convicted of cocaine trafficking",
+    "category": "crime"
+  }
+]

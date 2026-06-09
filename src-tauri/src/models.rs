@@ -64,6 +64,10 @@ pub struct CustomPublisherDef {
     pub name: String,
     /// The URL to scrape (RSS feed URL, sitemap URL, or homepage URL for HTML).
     pub rss_url: String,
+    /// The publisher's public website, which may differ from a hosted feed URL.
+    pub site_url: String,
+    /// The icon discovered from the publisher website.
+    pub logo_url: String,
     pub scrape_method: String,
     pub scrape_config: String,
     pub is_global: bool,
@@ -91,6 +95,7 @@ pub struct Article {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StoryCluster {
     pub id: String,
+    pub story_key: String,
     pub primary_headline: String,
     pub first_reported_at: String,
     pub last_updated: String,
@@ -99,7 +104,34 @@ pub struct StoryCluster {
     pub ai_headline: String,
     /// AI-generated summary (empty string until generated).
     pub ai_summary: String,
+    pub blindspot_explanation: BlindspotExplanation,
+    pub perspective_groups: Vec<PerspectiveGroup>,
     pub articles: Vec<Article>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BlindspotExplanation {
+    pub covered_categories: Vec<BiasCategory>,
+    pub missing_independent_coverage: bool,
+    pub publisher_count: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PerspectiveArticle {
+    pub article_id: String,
+    pub publisher_id: String,
+    pub publisher_name: String,
+    pub headline: String,
+    pub snippet: String,
+    pub published_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PerspectiveGroup {
+    pub bias_category: BiasCategory,
+    pub common_terms: Vec<String>,
+    pub distinct_terms: Vec<String>,
+    pub articles: Vec<PerspectiveArticle>,
 }
 
 /// Response wrapper (matches TS `ClustersResponse` interface).
@@ -119,6 +151,13 @@ pub struct ArticleBody {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RefreshResult {
     pub message: String,
+    pub failed_sources: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RefreshStatus {
+    pub last_refresh_at: Option<String>,
+    pub cooldown_remaining_seconds: u64,
     pub failed_sources: Vec<String>,
 }
 

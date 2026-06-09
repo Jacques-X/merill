@@ -6,6 +6,7 @@ mod native_bridge;
 mod pipeline;
 mod publishers;
 mod scraper;
+mod semantic_clustering;
 mod translate;
 
 // ── iOS Foundation Models bridge ────────────────────────────────────────────
@@ -19,6 +20,8 @@ mod ios_ai {
 
     type GenerateSummaryFn =
         unsafe extern "C" fn(*const c_char, *mut c_char, i32) -> bool;
+    type GenerateEmbeddingsFn =
+        unsafe extern "C" fn(*const c_char, *mut c_char, i32) -> bool;
 
     fn generate_summary_fn() -> Option<GenerateSummaryFn> {
         let symbol = CString::new("merill_generate_summary").ok()?;
@@ -28,6 +31,16 @@ mod ios_ai {
             None
         } else {
             Some(unsafe { std::mem::transmute::<*mut c_void, GenerateSummaryFn>(address) })
+        }
+    }
+
+    fn generate_embeddings_fn() -> Option<GenerateEmbeddingsFn> {
+        let symbol = CString::new("merill_generate_embeddings").ok()?;
+        let address = unsafe { dlsym((-2isize) as *mut c_void, symbol.as_ptr()) };
+        if address.is_null() {
+            None
+        } else {
+            Some(unsafe { std::mem::transmute::<*mut c_void, GenerateEmbeddingsFn>(address) })
         }
     }
 
@@ -49,6 +62,20 @@ mod ios_ai {
             v["summary"].as_str()?.to_string(),
         ))
     }
+
+    pub fn embed(texts: &[String]) -> Option<Vec<Vec<f32>>> {
+        let generate_embeddings = generate_embeddings_fn()?;
+        let c_input = CString::new(serde_json::to_string(texts).ok()?).ok()?;
+        let mut buf = vec![0i8; texts.len().saturating_mul(8192).max(32768)];
+        let ok = unsafe {
+            generate_embeddings(c_input.as_ptr(), buf.as_mut_ptr(), buf.len() as i32)
+        };
+        if !ok {
+            return None;
+        }
+        let json = unsafe { CStr::from_ptr(buf.as_ptr()) }.to_str().ok()?;
+        serde_json::from_str(json).ok()
+    }
 }
 
 fn generate_summary_impl(headlines: &[String], snippets: &[String]) -> (String, String) {
@@ -66,6 +93,7 @@ fn generate_summary_impl(headlines: &[String], snippets: &[String]) -> (String, 
 
 use r2d2::Pool;
 use r2d2_sqlite::SqliteConnectionManager;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::{Mutex, OnceLock};
 use std::time::Instant;
@@ -95,6 +123,7 @@ const SCRAPE_COOLDOWN_SECS: u64 = 5 * 60;
 pub(crate) struct MerillCore {
     db: DbPool,
     last_scraped: Mutex<Option<Instant>>,
+    refresh_status: Mutex<models::RefreshStatus>,
 }
 
 impl MerillCore {
@@ -122,40 +151,163 @@ impl MerillCore {
         Ok(Self {
             db,
             last_scraped: Mutex::new(None),
+            refresh_status: Mutex::new(models::RefreshStatus {
+                last_refresh_at: None,
+                cooldown_remaining_seconds: 0,
+                failed_sources: Vec::new(),
+            }),
         })
     }
 }
 
 // ── Tauri Commands ──────────────────────────────────────────────────────────
 
-pub(crate) async fn get_clusters_core(
-    state: &MerillCore,
-    blindspots_only: bool,
-) -> Result<ClustersResponse, String> {
-    let conn = state.db.get().map_err(|e| e.to_string())?;
-    let raw = db::load_clusters_light(&conn, blindspots_only).map_err(|e| e.to_string())?;
+fn normalize_story_text(value: &str) -> String {
+    value
+        .to_lowercase()
+        .chars()
+        .map(|ch| if ch.is_alphanumeric() { ch } else { ' ' })
+        .collect::<String>()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
 
-    // Build a fast lookup for custom publishers so their is_global flag is correct.
-    let custom_pub_map: std::collections::HashMap<String, models::PublisherInfo> =
-        db::get_custom_publishers(&conn)
-            .unwrap_or_default()
-            .into_iter()
-            .map(|p| {
-                let info = models::PublisherInfo {
-                    id: p.id.clone(),
-                    name: p.name,
-                    bias_category: models::BiasCategory::CommercialIndependent,
-                    logo_url: favicon_from_url(&p.rss_url),
-                    is_global: p.is_global,
-                };
-                (p.id, info)
-            })
-            .collect();
+fn normalized_story_url(value: &str) -> String {
+    let without_fragment = value.split('#').next().unwrap_or(value);
+    let without_query = without_fragment.split('?').next().unwrap_or(without_fragment);
+    without_query.trim_end_matches('/').to_lowercase()
+}
 
-    let clusters: Vec<StoryCluster> = raw
+fn story_key_for_articles(articles: &[Article]) -> String {
+    let representative = articles.iter().min_by(|a, b| {
+        a.published_at
+            .cmp(&b.published_at)
+            .then_with(|| a.id.cmp(&b.id))
+    });
+    let seed = representative
+        .map(|article| {
+            format!(
+                "{}|{}",
+                normalized_story_url(&article.original_url),
+                normalize_story_text(&article.original_headline)
+            )
+        })
+        .unwrap_or_default();
+    use sha2::{Digest, Sha256};
+    format!("story_{:x}", Sha256::digest(seed.as_bytes()))
+}
+
+fn comparison_terms(value: &str) -> HashSet<String> {
+    const STOP: &[&str] = &[
+        "about", "after", "before", "from", "have", "malta", "maltese", "news", "said",
+        "says", "that", "their", "this", "with", "will", "għal", "mill", "jgħid", "qed",
+    ];
+    normalize_story_text(value)
+        .split_whitespace()
+        .filter(|word| word.chars().count() >= 4 && !STOP.contains(word))
+        .map(str::to_string)
+        .collect()
+}
+
+fn perspective_groups(articles: &[Article]) -> Vec<models::PerspectiveGroup> {
+    let mut grouped: HashMap<models::BiasCategory, Vec<&Article>> = HashMap::new();
+    for article in articles {
+        grouped
+            .entry(article.publisher.bias_category)
+            .or_default()
+            .push(article);
+    }
+
+    let mut groups: Vec<_> = grouped
+        .into_iter()
+        .map(|(bias_category, group_articles)| {
+            let term_sets: Vec<HashSet<String>> = group_articles
+                .iter()
+                .map(|article| comparison_terms(&article.original_headline))
+                .collect();
+            let common = term_sets
+                .first()
+                .cloned()
+                .unwrap_or_default()
+                .into_iter()
+                .filter(|term| term_sets.iter().all(|set| set.contains(term)))
+                .collect::<HashSet<_>>();
+            let group_terms: HashSet<String> =
+                term_sets.iter().flat_map(|set| set.iter().cloned()).collect();
+            let other_terms: HashSet<String> = articles
+                .iter()
+                .filter(|article| article.publisher.bias_category != bias_category)
+                .flat_map(|article| comparison_terms(&article.original_headline))
+                .collect();
+            let mut common_terms: Vec<String> = common.into_iter().collect();
+            let mut distinct_terms: Vec<String> = group_terms
+                .difference(&other_terms)
+                .cloned()
+                .collect();
+            common_terms.sort();
+            distinct_terms.sort();
+            common_terms.truncate(6);
+            distinct_terms.truncate(6);
+
+            models::PerspectiveGroup {
+                bias_category,
+                common_terms,
+                distinct_terms,
+                articles: group_articles
+                    .into_iter()
+                    .map(|article| models::PerspectiveArticle {
+                        article_id: article.id.clone(),
+                        publisher_id: article.publisher_id.clone(),
+                        publisher_name: article.publisher.name.clone(),
+                        headline: article.original_headline.clone(),
+                        snippet: article.snippet.clone(),
+                        published_at: article.published_at.clone(),
+                    })
+                    .collect(),
+            }
+        })
+        .collect();
+    groups.sort_by_key(|group| format!("{:?}", group.bias_category));
+    groups
+}
+
+fn blindspot_explanation(articles: &[Article]) -> models::BlindspotExplanation {
+    let mut covered_categories: Vec<_> = articles
+        .iter()
+        .map(|article| article.publisher.bias_category)
+        .collect::<HashSet<_>>()
+        .into_iter()
+        .collect();
+    covered_categories.sort_by_key(|category| format!("{:?}", category));
+    let missing_independent_coverage = !covered_categories.iter().any(|category| {
+        matches!(
+            category,
+            models::BiasCategory::CommercialIndependent
+                | models::BiasCategory::InvestigativeIndependent
+        )
+    });
+    models::BlindspotExplanation {
+        covered_categories,
+        missing_independent_coverage,
+        publisher_count: articles
+            .iter()
+            .map(|article| article.publisher_id.as_str())
+            .collect::<HashSet<_>>()
+            .len(),
+    }
+}
+
+fn cluster_rows_to_response(
+    rows: Vec<db::ClusterRowLight>,
+    custom_pub_map: &HashMap<String, models::PublisherInfo>,
+    saved_story_keys: &HashMap<String, String>,
+) -> ClustersResponse {
+    let clusters = rows
         .into_iter()
         .map(|c| {
-            let arts: Vec<Article> = c.articles
+            let articles: Vec<Article> = c
+                .articles
                 .into_iter()
                 .map(|a| {
                     let translated = if a.translated_headline.is_empty() {
@@ -163,14 +315,14 @@ pub(crate) async fn get_clusters_core(
                     } else {
                         a.translated_headline
                     };
-                    let pub_info = custom_pub_map
+                    let publisher = custom_pub_map
                         .get(&a.publisher_id)
                         .cloned()
                         .unwrap_or_else(|| publisher_info(&a.publisher_id));
                     Article {
                         id: a.id,
-                        publisher_id: a.publisher_id.clone(),
-                        publisher: pub_info,
+                        publisher_id: a.publisher_id,
+                        publisher,
                         original_url: a.original_url,
                         original_headline: a.headline,
                         translated_headline: translated,
@@ -186,18 +338,144 @@ pub(crate) async fn get_clusters_core(
                 .collect();
             StoryCluster {
                 id: c.id,
+                story_key: articles
+                    .iter()
+                    .find_map(|article| saved_story_keys.get(&article.id).cloned())
+                    .unwrap_or_else(|| story_key_for_articles(&articles)),
                 primary_headline: c.headline,
                 first_reported_at: c.first_reported,
                 last_updated: c.last_updated,
                 is_blindspot: c.is_blindspot,
                 ai_headline: c.ai_headline,
                 ai_summary: c.ai_summary,
-                articles: arts,
+                blindspot_explanation: blindspot_explanation(&articles),
+                perspective_groups: perspective_groups(&articles),
+                articles,
             }
         })
         .collect();
+    ClustersResponse { clusters }
+}
 
-    Ok(ClustersResponse { clusters })
+fn custom_publisher_map(conn: &rusqlite::Connection) -> HashMap<String, models::PublisherInfo> {
+    db::get_custom_publishers(conn)
+        .unwrap_or_default()
+        .into_iter()
+        .map(|publisher| {
+            let logo_url = custom_publisher_logo(conn, &publisher);
+            let info = models::PublisherInfo {
+                id: publisher.id.clone(),
+                name: publisher.name,
+                bias_category: models::BiasCategory::CommercialIndependent,
+                logo_url,
+                is_global: publisher.is_global,
+            };
+            (publisher.id, info)
+        })
+        .collect()
+}
+
+pub(crate) async fn get_clusters_core(
+    state: &MerillCore,
+    blindspots_only: bool,
+) -> Result<ClustersResponse, String> {
+    let conn = state.db.get().map_err(|e| e.to_string())?;
+    let raw = db::load_clusters_light(&conn, blindspots_only).map_err(|e| e.to_string())?;
+    let saved_story_keys = db::saved_story_keys_by_article(&conn).map_err(|e| e.to_string())?;
+
+    Ok(cluster_rows_to_response(
+        raw,
+        &custom_publisher_map(&conn),
+        &saved_story_keys,
+    ))
+}
+
+pub(crate) fn get_saved_stories_core(state: &MerillCore) -> Result<ClustersResponse, String> {
+    let conn = state.db.get().map_err(|e| e.to_string())?;
+    let rows = db::load_saved_clusters_light(&conn).map_err(|e| e.to_string())?;
+    let saved_story_keys = db::saved_story_keys_by_article(&conn).map_err(|e| e.to_string())?;
+    Ok(cluster_rows_to_response(
+        rows,
+        &custom_publisher_map(&conn),
+        &saved_story_keys,
+    ))
+}
+
+pub(crate) fn search_stories_core(
+    state: &MerillCore,
+    query: String,
+) -> Result<ClustersResponse, String> {
+    if query.trim().is_empty() {
+        return Ok(ClustersResponse { clusters: Vec::new() });
+    }
+    let conn = state.db.get().map_err(|e| e.to_string())?;
+    let rows = db::search_clusters_light(&conn, &query).map_err(|e| e.to_string())?;
+    let saved_story_keys = db::saved_story_keys_by_article(&conn).map_err(|e| e.to_string())?;
+    Ok(cluster_rows_to_response(
+        rows,
+        &custom_publisher_map(&conn),
+        &saved_story_keys,
+    ))
+}
+
+pub(crate) fn save_story_core(
+    state: &MerillCore,
+    story_key: String,
+    article_ids: Vec<String>,
+) -> Result<(), String> {
+    let mut conn = state.db.get().map_err(|e| e.to_string())?;
+    db::save_story(&mut conn, &story_key, &article_ids).map_err(|e| e.to_string())
+}
+
+pub(crate) fn unsave_story_core(state: &MerillCore, story_key: String) -> Result<(), String> {
+    let conn = state.db.get().map_err(|e| e.to_string())?;
+    db::unsave_story(&conn, &story_key).map_err(|e| e.to_string())
+}
+
+pub(crate) fn get_refresh_status_core(state: &MerillCore) -> models::RefreshStatus {
+    let mut status = state.refresh_status.lock().unwrap().clone();
+    status.cooldown_remaining_seconds = state
+        .last_scraped
+        .lock()
+        .unwrap()
+        .map(|last| SCRAPE_COOLDOWN_SECS.saturating_sub(last.elapsed().as_secs()))
+        .unwrap_or(0);
+    status
+}
+
+#[tauri::command]
+fn get_saved_stories(state: tauri::State<'_, MerillCore>) -> Result<ClustersResponse, String> {
+    get_saved_stories_core(&state)
+}
+
+#[tauri::command]
+fn search_stories(
+    state: tauri::State<'_, MerillCore>,
+    query: String,
+) -> Result<ClustersResponse, String> {
+    search_stories_core(&state, query)
+}
+
+#[tauri::command]
+fn save_story(
+    state: tauri::State<'_, MerillCore>,
+    story_key: String,
+    article_ids: Vec<String>,
+) -> Result<(), String> {
+    save_story_core(&state, story_key, article_ids)
+}
+
+#[tauri::command]
+fn unsave_story(
+    state: tauri::State<'_, MerillCore>,
+    story_key: String,
+) -> Result<(), String> {
+    unsave_story_core(&state, story_key)
+}
+
+#[tauri::command]
+fn get_refresh_status(state: tauri::State<'_, MerillCore>) -> models::RefreshStatus {
+    get_refresh_status_core(&state)
 }
 
 #[tauri::command]
@@ -219,7 +497,7 @@ pub(crate) async fn refresh_feed_core(state: &MerillCore) -> Result<RefreshResul
                 );
                 return Ok(RefreshResult {
                     message: "Refreshed from cache".to_string(),
-                    failed_sources: Vec::new(),
+                    failed_sources: state.refresh_status.lock().unwrap().failed_sources.clone(),
                 });
             }
         }
@@ -232,6 +510,12 @@ pub(crate) async fn refresh_feed_core(state: &MerillCore) -> Result<RefreshResul
     {
         let mut last = state.last_scraped.lock().unwrap();
         *last = Some(Instant::now());
+    }
+    {
+        let mut status = state.refresh_status.lock().unwrap();
+        status.last_refresh_at = Some(chrono::Utc::now().to_rfc3339());
+        status.failed_sources = result.failed_sources.clone();
+        status.cooldown_remaining_seconds = SCRAPE_COOLDOWN_SECS;
     }
 
     Ok(RefreshResult {
@@ -390,11 +674,12 @@ pub(crate) fn get_publishers_core(state: &MerillCore) -> Vec<models::PublisherIn
     if let Ok(conn) = state.db.get() {
         if let Ok(custom) = db::get_custom_publishers(&conn) {
             for p in custom {
+                let logo_url = custom_publisher_logo(&conn, &p);
                 list.push(models::PublisherInfo {
-                    id: p.id,
+                    id: p.id.clone(),
                     name: p.name,
                     bias_category: models::BiasCategory::CommercialIndependent,
-                    logo_url: favicon_from_url(&p.rss_url),
+                    logo_url,
                     is_global: p.is_global,
                 });
             }
@@ -435,10 +720,30 @@ pub(crate) async fn add_custom_publisher_core(
     let bytes = resp.bytes().await.map_err(|e| e.to_string())?;
 
     // ── Method 1: direct RSS/Atom ──────────────────────────────────────────
-    enum Found { Rss { scrape_url: String, title: Option<String> }, Sitemap(String), Html { scrape_url: String, selector: String } }
+    enum Found {
+        Rss {
+            scrape_url: String,
+            title: Option<String>,
+            site_url: String,
+        },
+        Sitemap {
+            scrape_url: String,
+            site_url: String,
+        },
+        Html {
+            scrape_url: String,
+            selector: String,
+            site_url: String,
+        },
+    }
 
     let found: Found = if let Ok(feed) = feed_rs::parser::parse(&bytes[..]) {
-        Found::Rss { scrape_url: final_url.clone(), title: feed.title.map(|t| t.content) }
+        let site_url = feed_site_url(&feed, &final_url);
+        Found::Rss {
+            scrape_url: final_url.clone(),
+            title: feed.title.map(|t| t.content),
+            site_url,
+        }
     } else if content_type.contains("html") || content_type.is_empty() {
         let html = String::from_utf8_lossy(&bytes);
 
@@ -452,15 +757,26 @@ pub(crate) async fn add_custom_publisher_core(
             let bytes2 = resp2.bytes().await.map_err(|e| e.to_string())?;
             let feed = feed_rs::parser::parse(&bytes2[..])
                 .map_err(|_| "Found a feed link but could not parse it".to_string())?;
-            Found::Rss { scrape_url: feed_url, title: feed.title.map(|t| t.content) }
+            Found::Rss {
+                scrape_url: feed_url,
+                title: feed.title.map(|t| t.content),
+                site_url: final_url.clone(),
+            }
         } else {
             // ── Method 3: Google News sitemap ────────────────────────────
             match probe_sitemap_paths(&final_url).await {
-                Some(sitemap_url) => Found::Sitemap(sitemap_url),
+                Some(sitemap_url) => Found::Sitemap {
+                    scrape_url: sitemap_url,
+                    site_url: final_url.clone(),
+                },
                 None => {
                     // ── Method 4: HTML auto-detect ───────────────────────
                     match scraper::auto_detect_article_sel(&html) {
-                        Some(selector) => Found::Html { scrape_url: final_url.clone(), selector },
+                        Some(selector) => Found::Html {
+                            scrape_url: final_url.clone(),
+                            selector,
+                            site_url: final_url.clone(),
+                        },
                         None => return Err(
                             "Could not find a feed, sitemap, or recognisable article structure at this URL.".to_string()
                         ),
@@ -483,10 +799,24 @@ pub(crate) async fn add_custom_publisher_core(
         })
     };
 
-    let (scrape_url, scrape_method, scrape_config, auto_name) = match found {
-        Found::Rss { scrape_url, title } => (scrape_url, "rss".to_string(), String::new(), title),
-        Found::Sitemap(sitemap_url) => (sitemap_url, "sitemap".to_string(), String::new(), page_title()),
-        Found::Html { scrape_url, selector } => (scrape_url.clone(), "html".to_string(), selector, page_title()),
+    let (scrape_url, site_url, scrape_method, scrape_config, auto_name) = match found {
+        Found::Rss { scrape_url, title, site_url } => {
+            (scrape_url, site_url, "rss".to_string(), String::new(), title)
+        }
+        Found::Sitemap { scrape_url, site_url } => {
+            (scrape_url, site_url, "sitemap".to_string(), String::new(), page_title())
+        }
+        Found::Html { scrape_url, selector, site_url } => {
+            (scrape_url, site_url, "html".to_string(), selector, page_title())
+        }
+    };
+    let logo_url = if site_url == final_url
+        && (content_type.contains("html") || content_type.is_empty())
+    {
+        discover_icon_url(&String::from_utf8_lossy(&bytes), &site_url)
+            .unwrap_or_else(|| favicon_from_url(&site_url))
+    } else {
+        discover_publisher_icon(&site_url).await
     };
 
     let resolved_name = if name.trim().is_empty() {
@@ -504,6 +834,8 @@ pub(crate) async fn add_custom_publisher_core(
         id: id.clone(),
         name: resolved_name.clone(),
         rss_url: scrape_url,
+        site_url,
+        logo_url: logo_url.clone(),
         scrape_method,
         scrape_config,
         is_global,
@@ -518,7 +850,7 @@ pub(crate) async fn add_custom_publisher_core(
         id,
         name: resolved_name,
         bias_category: models::BiasCategory::CommercialIndependent,
-        logo_url: favicon_from_url(&final_url),
+        logo_url,
         is_global,
     })
 }
@@ -536,16 +868,103 @@ async fn add_custom_publisher(
 /// Derive a favicon URL from any URL by keeping only the scheme + host.
 /// e.g. "https://bbc.com/news/rss.xml" → "https://bbc.com/favicon.ico"
 fn favicon_from_url(url: &str) -> String {
-    let after_scheme = url.find("://").map(|i| i + 3).unwrap_or(0);
-    let host_end = url[after_scheme..]
-        .find('/')
-        .map(|i| i + after_scheme)
-        .unwrap_or(url.len());
-    if host_end > after_scheme {
-        format!("{}/favicon.ico", &url[..host_end])
-    } else {
-        String::new()
+    url_origin(url)
+        .map(|origin| format!("{}/favicon.ico", origin.trim_end_matches('/')))
+        .unwrap_or_default()
+}
+
+fn custom_publisher_logo(
+    conn: &rusqlite::Connection,
+    publisher: &models::CustomPublisherDef,
+) -> String {
+    if !publisher.logo_url.is_empty() {
+        return publisher.logo_url.clone();
     }
+    if !publisher.site_url.is_empty() {
+        return favicon_from_url(&publisher.site_url);
+    }
+    let fallback_url = db::latest_article_url_for_publisher(conn, &publisher.id)
+        .ok()
+        .flatten()
+        .unwrap_or_else(|| publisher.rss_url.clone());
+    favicon_from_url(&fallback_url)
+}
+
+fn url_origin(url: &str) -> Option<String> {
+    let parsed = reqwest::Url::parse(url).ok()?;
+    let host = parsed.host_str()?;
+    let mut origin = format!("{}://{}", parsed.scheme(), host);
+    if let Some(port) = parsed.port() {
+        origin.push_str(&format!(":{}", port));
+    }
+    Some(origin)
+}
+
+fn resolve_url(base_url: &str, href: &str) -> Option<String> {
+    reqwest::Url::parse(base_url)
+        .ok()?
+        .join(href.trim())
+        .ok()
+        .map(Into::into)
+}
+
+fn feed_site_url(feed: &feed_rs::model::Feed, feed_url: &str) -> String {
+    feed.links
+        .iter()
+        .find(|link| link.rel.as_deref().is_none_or(|rel| rel == "alternate"))
+        .or_else(|| feed.links.first())
+        .and_then(|link| resolve_url(feed_url, &link.href))
+        .or_else(|| url_origin(feed_url))
+        .unwrap_or_else(|| feed_url.to_string())
+}
+
+async fn discover_publisher_icon(site_url: &str) -> String {
+    let fallback = favicon_from_url(site_url);
+    let Ok(response) = http_client().get(site_url).send().await else {
+        return fallback;
+    };
+    let final_url = response.url().to_string();
+    let Ok(html) = response.text().await else {
+        return fallback;
+    };
+    discover_icon_url(&html, &final_url).unwrap_or(fallback)
+}
+
+fn discover_icon_url(html: &str, base_url: &str) -> Option<String> {
+    let lower = html.to_lowercase();
+    let mut search = 0;
+    let mut best: Option<(u8, String)> = None;
+    while let Some(pos) = lower[search..].find("<link") {
+        let abs = search + pos;
+        let end = lower[abs..]
+            .find('>')
+            .map(|offset| abs + offset + 1)
+            .unwrap_or(html.len());
+        let tag = &html[abs..end];
+        let rel = extract_attr(tag, "rel").unwrap_or_default().to_lowercase();
+        if rel.split_whitespace().any(|value| value.contains("icon")) {
+            if let Some(href) = extract_attr(tag, "href") {
+                if let Some(icon_url) = resolve_url(base_url, &href) {
+                    let tag_lower = tag.to_lowercase();
+                    let score = if rel.contains("apple-touch-icon")
+                        || tag_lower.contains("192x192")
+                        || tag_lower.contains("180x180")
+                    {
+                        3
+                    } else if href.to_lowercase().ends_with(".png") {
+                        2
+                    } else {
+                        1
+                    };
+                    if best.as_ref().is_none_or(|(best_score, _)| score > *best_score) {
+                        best = Some((score, icon_url));
+                    }
+                }
+            }
+        }
+        search = end;
+    }
+    best.map(|(_, url)| url)
 }
 
 /// Scan HTML for <link rel="alternate" type="application/rss+xml" href="...">
@@ -563,16 +982,7 @@ fn discover_feed_url(html: &str, base_url: &str) -> Option<String> {
             // Extract href value from the original (non-lowercased) tag
             let orig_tag = &html[abs..end];
             if let Some(href) = extract_attr(orig_tag, "href") {
-                // Resolve relative URLs
-                let absolute = if href.starts_with("http://") || href.starts_with("https://") {
-                    href
-                } else {
-                    let path = href.trim_start_matches('/');
-                    // Get origin from base_url
-                    let origin = base_url.splitn(4, '/').take(3).collect::<Vec<_>>().join("/");
-                    format!("{}/{}", origin.trim_end_matches('/'), path)
-                };
-                return Some(absolute);
+                return resolve_url(base_url, &href);
             }
         }
         search = end;
@@ -775,7 +1185,66 @@ pub fn run() {
             Ok(())
         })
         .plugin(tauri_plugin_opener::init())
-        .invoke_handler(tauri::generate_handler![get_clusters, get_publishers, refresh_feed, fetch_article_body, translate_summary, generate_cluster_summary, add_custom_publisher, remove_custom_publisher, split_cluster, force_recluster, wipe_all_data])
+        .invoke_handler(tauri::generate_handler![get_clusters, get_saved_stories, search_stories, save_story, unsave_story, get_refresh_status, get_publishers, refresh_feed, fetch_article_body, translate_summary, generate_cluster_summary, add_custom_publisher, remove_custom_publisher, split_cluster, force_recluster, wipe_all_data])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
+}
+
+#[cfg(test)]
+mod product_tests {
+    use super::*;
+
+    fn article(id: &str, published_at: &str, publisher: models::PublisherInfo) -> Article {
+        Article {
+            id: id.to_string(),
+            publisher_id: publisher.id.clone(),
+            publisher,
+            original_url: format!("https://example.com/news/{id}?tracking=1"),
+            original_headline: "Harbour project approved in Valletta".to_string(),
+            translated_headline: String::new(),
+            snippet: String::new(),
+            body_text: String::new(),
+            image_url: String::new(),
+            language: "en".to_string(),
+            published_at: published_at.to_string(),
+            story_cluster_id: "cluster".to_string(),
+            category: "local".to_string(),
+        }
+    }
+
+    #[test]
+    fn story_key_is_stable_across_article_order() {
+        let publisher = publishers::publisher_info("times_of_malta");
+        let first = article("first", "2026-01-01T00:00:00Z", publisher.clone());
+        let second = article("second", "2026-01-01T01:00:00Z", publisher);
+        assert_eq!(
+            story_key_for_articles(&[first.clone(), second.clone()]),
+            story_key_for_articles(&[second, first])
+        );
+    }
+
+    #[test]
+    fn blindspot_explanation_detects_missing_independent_coverage() {
+        let article = article("party", "2026-01-01T00:00:00Z", publishers::publisher_info("one_news"));
+        let explanation = blindspot_explanation(&[article]);
+        assert!(explanation.missing_independent_coverage);
+        assert_eq!(explanation.publisher_count, 1);
+    }
+
+    #[test]
+    fn publisher_icon_discovery_resolves_relative_urls() {
+        let html = r#"
+            <html>
+              <head>
+                <link rel="icon" href="/assets/favicon.ico">
+                <link rel="apple-touch-icon" sizes="180x180" href="images/touch.png">
+              </head>
+            </html>
+        "#;
+
+        assert_eq!(
+            discover_icon_url(html, "https://news.example.com/section/"),
+            Some("https://news.example.com/section/images/touch.png".to_string())
+        );
+    }
 }

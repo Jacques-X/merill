@@ -25,6 +25,20 @@ enum BiasCategory: String, Codable, CaseIterable {
         case .right: return .blue
         }
     }
+
+    func title(_ language: String) -> String {
+        switch self {
+        case .stateOwned: return L10n.text(language, "State-owned", "Tal-Istat")
+        case .partyOwnedPL: return L10n.text(language, "Labour-owned", "Tal-Partit Laburista")
+        case .partyOwnedPN: return L10n.text(language, "Nationalist-owned", "Tal-Partit Nazzjonalista")
+        case .churchOwned: return L10n.text(language, "Church-owned", "Tal-Knisja")
+        case .commercialIndependent: return L10n.text(language, "Independent", "Indipendenti")
+        case .investigativeIndependent: return L10n.text(language, "Investigative", "Investigattiv")
+        case .left: return L10n.text(language, "Left", "Xellug")
+        case .centre: return L10n.text(language, "Centre", "Ċentru")
+        case .right: return L10n.text(language, "Right", "Lemin")
+        }
+    }
 }
 
 struct Publisher: Codable, Identifiable, Hashable {
@@ -66,12 +80,15 @@ struct Article: Codable, Identifiable, Hashable {
 
 struct StoryCluster: Codable, Identifiable, Hashable {
     let id: String
+    let storyKey: String
     let primaryHeadline: String
     let firstReportedAt: String
     let lastUpdated: String
     let isBlindspot: Bool
     let aiHeadline: String
     let aiSummary: String
+    let blindspotExplanation: BlindspotExplanation
+    let perspectiveGroups: [PerspectiveGroup]
     let articles: [Article]
 
     func headline(language: String) -> String {
@@ -109,12 +126,44 @@ struct StoryCluster: Codable, Identifiable, Hashable {
     }
 }
 
+struct BlindspotExplanation: Codable, Hashable {
+    let coveredCategories: [BiasCategory]
+    let missingIndependentCoverage: Bool
+    let publisherCount: Int
+}
+
+struct PerspectiveArticle: Codable, Identifiable, Hashable {
+    let articleId: String
+    let publisherId: String
+    let publisherName: String
+    let headline: String
+    let snippet: String
+    let publishedAt: String
+
+    var id: String { articleId }
+}
+
+struct PerspectiveGroup: Codable, Identifiable, Hashable {
+    let biasCategory: BiasCategory
+    let commonTerms: [String]
+    let distinctTerms: [String]
+    let articles: [PerspectiveArticle]
+
+    var id: String { biasCategory.rawValue }
+}
+
 struct ClustersResponse: Codable {
     let clusters: [StoryCluster]
 }
 
 struct RefreshResult: Codable {
     let message: String
+    let failedSources: [String]
+}
+
+struct RefreshStatus: Codable {
+    let lastRefreshAt: String?
+    let cooldownRemainingSeconds: UInt64
     let failedSources: [String]
 }
 
@@ -131,6 +180,14 @@ struct SummaryResult: Codable {
 enum FeedScope: String, CaseIterable, Identifiable {
     case local
     case global
+    var id: Self { self }
+}
+
+enum FeedSort: String, CaseIterable, Identifiable {
+    case balanced
+    case latest
+    case covered
+    case blindspots
     var id: Self { self }
 }
 
@@ -172,6 +229,27 @@ enum ReaderScale: String, CaseIterable {
         case .large: return .title2
         }
     }
+}
+
+enum ReaderLineSpacing: String, CaseIterable, Identifiable {
+    case compact
+    case comfortable
+    case relaxed
+    var id: Self { self }
+
+    var value: CGFloat {
+        switch self {
+        case .compact: return 2
+        case .comfortable: return 5
+        case .relaxed: return 9
+        }
+    }
+}
+
+enum ReaderTextMode: String, CaseIterable, Identifiable {
+    case translated
+    case original
+    var id: Self { self }
 }
 
 extension JSONDecoder {

@@ -2,8 +2,8 @@ import { useState, useEffect, useCallback, useRef, useMemo } from "react";
 import { useQueryClient } from "@tanstack/react-query";
 import { formatDistanceToNow } from "date-fns";
 import { invoke } from "@tauri-apps/api/core";
-import { ArrowLeft, Check, ChevronDown, ChevronRight, ExternalLink, Filter, MoreHorizontal, Plus, Settings2, Trash2, X } from "lucide-react";
-import { useClusters, usePublishers, refreshFeed, addCustomPublisher, removeCustomPublisher, splitCluster, forceRecluster, wipeAllData, clusterKeys } from "@/api/clusters";
+import { ArrowLeft, Check, ChevronDown, ChevronRight, ExternalLink, Filter, Info, MoreHorizontal, Plus, Search, Settings2, Trash2, X } from "lucide-react";
+import { useClusters, usePublishers, useSavedStories, refreshFeed, searchStories, saveStory, unsaveStory, getRefreshStatus, addCustomPublisher, removeCustomPublisher, splitCluster, forceRecluster, wipeAllData, clusterKeys } from "@/api/clusters";
 import { StoryCard } from "@/components/StoryCard/StoryCard";
 import { BiasBar } from "@/components/BiasBar/BiasBar";
 import { computeBiasCoverage } from "@/utils/bias";
@@ -215,6 +215,18 @@ const GROUPING_STOP_WORDS = new Set([
   "elezzjoni", "elezzjonijiet", "generali", "vot", "voti", "votazzjoni", "jivvota",
 ]);
 
+const BIAS_I18N: Record<BiasCategory, import("@/utils/i18n").LangKey> = {
+  state_owned: "biasState",
+  party_owned_pl: "biasPl",
+  party_owned_pn: "biasPn",
+  church_owned: "biasChurch",
+  commercial_independent: "biasIndependent",
+  investigative_independent: "biasInvestigative",
+  left: "biasLeft",
+  centre: "biasCentre",
+  right: "biasRight",
+};
+
 function groupingTokens(text: string): Set<string> {
   const tokens = text
     .toLowerCase()
@@ -263,9 +275,14 @@ export function StoryDetailScreen({
   const biasOverrides = useAppStore(s => s.publisherBiasOverrides);
   const readerFontSize = useAppStore(s => s.readerFontSize);
   const setReaderFontSize = useAppStore(s => s.setReaderFontSize);
+  const readerLineSpacing = useAppStore(s => s.readerLineSpacing);
+  const setReaderLineSpacing = useAppStore(s => s.setReaderLineSpacing);
+  const readerTextMode = useAppStore(s => s.readerTextMode);
+  const setReaderTextMode = useAppStore(s => s.setReaderTextMode);
   const queryClient = useQueryClient();
   const [selectedArticle, setSelectedArticle] = useState<Article | null>(null);
   const [articleBody, setArticleBody] = useState<string>("");
+  const [localizedArticleBody, setLocalizedArticleBody] = useState<string>("");
   const [loadingBody, setLoadingBody] = useState(false);
   const [articleError, setArticleError] = useState<string | null>(null);
   const [detailActionError, setDetailActionError] = useState<string | null>(null);
@@ -278,6 +295,7 @@ export function StoryDetailScreen({
   const [summaryLoading, setSummaryLoading] = useState(true);
   const [translatedSummary, setTranslatedSummary] = useState<string>("");
   const [timelineOpen, setTimelineOpen] = useState(false);
+  const [advancedTermsOpen, setAdvancedTermsOpen] = useState(false);
   const [reviewOpen, setReviewOpen] = useState(false);
   const [groupMenuOpen, setGroupMenuOpen] = useState(false);
   const groupEvidence = useMemo(() => groupingEvidence(cluster), [cluster]);
@@ -287,8 +305,11 @@ export function StoryDetailScreen({
   [cluster.articles]);
 
   const selectedParagraphs = useMemo(
-    () => articleBody ? articleBody.split("\n\n").filter(Boolean).map(decodeHTMLEntities) : [],
-    [articleBody],
+    () => {
+      const body = readerTextMode === "translated" && localizedArticleBody ? localizedArticleBody : articleBody;
+      return body ? body.split("\n\n").filter(Boolean).map(decodeHTMLEntities) : [];
+    },
+    [articleBody, localizedArticleBody, readerTextMode],
   );
   const selectedDomain = selectedArticle?.original_url.replace(/^https?:\/\//, "").split("/")[0] ?? "";
   const readingMins = Math.max(1, Math.round(articleBody.split(/\s+/).filter(Boolean).length / 200));
@@ -362,9 +383,22 @@ export function StoryDetailScreen({
     return () => { cancelled = true; };
   }, [summaryLoading, summaries, lang, cluster.articles]);
 
+  useEffect(() => {
+    let cancelled = false;
+    setLocalizedArticleBody("");
+    if (!selectedArticle || !articleBody || readerTextMode === "original" || selectedArticle.language === lang) {
+      return;
+    }
+    invoke<string>("translate_summary", { text: articleBody, to: lang })
+      .then(value => { if (!cancelled) setLocalizedArticleBody(value); })
+      .catch(() => undefined);
+    return () => { cancelled = true; };
+  }, [articleBody, lang, readerTextMode, selectedArticle]);
+
   const openArticle = useCallback(async (a: Article) => {
     setSelectedArticle(a);
     setArticleError(null);
+    setLocalizedArticleBody("");
     const cached = summaries.get(a.id);
     setArticleBody(cached || a.body_text || "");
     if (!cached && !a.body_text) {
@@ -448,6 +482,20 @@ export function StoryDetailScreen({
             </div>
           </div>
 
+          <div className="reader-preferences">
+            <div className="segmented-control">
+              <button data-active={readerTextMode === "translated"} onClick={() => setReaderTextMode("translated")}>{t(lang, "translatedText")}</button>
+              <button data-active={readerTextMode === "original"} onClick={() => setReaderTextMode("original")}>{t(lang, "originalText")}</button>
+            </div>
+            <div className="segmented-control">
+              {(["compact", "comfortable", "relaxed"] as const).map(spacing => (
+                <button key={spacing} data-active={readerLineSpacing === spacing} onClick={() => setReaderLineSpacing(spacing)}>
+                  {t(lang, spacing === "compact" ? "spacingCompact" : spacing === "comfortable" ? "spacingComfortable" : "spacingRelaxed")}
+                </button>
+              ))}
+            </div>
+          </div>
+
           <h2 className="detail-headline">{articleHeadline(a, lang)}</h2>
 
           {articleError && (
@@ -455,7 +503,7 @@ export function StoryDetailScreen({
           )}
 
           {selectedParagraphs.length > 0 ? (
-            <div className={`detail-body font-${readerFontSize}`}>
+            <div className={`detail-body font-${readerFontSize} spacing-${readerLineSpacing}`}>
               {selectedParagraphs.map((p, i) => (<p key={i}>{p}</p>))}
             </div>
           ) : loadingBody ? (
@@ -464,7 +512,7 @@ export function StoryDetailScreen({
               <span>{t(lang, "loadingArticle")}</span>
             </div>
           ) : a.snippet ? (
-            <div className={`detail-body font-${readerFontSize}`}>
+            <div className={`detail-body font-${readerFontSize} spacing-${readerLineSpacing}`}>
               <p>{decodeHTMLEntities(a.snippet)}</p>
             </div>
           ) : (
@@ -528,6 +576,17 @@ export function StoryDetailScreen({
           <BiasBar coverage={coverage} />
         </div>
 
+        {cluster.blindspot_explanation.missing_independent_coverage && (
+          <div className="blindspot-explanation">
+            <strong>{t(lang, "whyBlindspot")}</strong>
+            <p>
+              {t(lang, "blindspotReason")
+                .replace("{count}", String(cluster.blindspot_explanation.publisher_count))
+                .replace("{categories}", cluster.blindspot_explanation.covered_categories.map(category => t(lang, BIAS_I18N[category])).join(", "))}
+            </p>
+          </div>
+        )}
+
         {detailActionError && (
           <div className="inline-error">{detailActionError}</div>
         )}
@@ -536,22 +595,36 @@ export function StoryDetailScreen({
           <span>{t(lang, "perspectives")}</span>
           <small>{t(lang, "swipeToCompare")}</small>
         </div>
-        <div className="perspective-carousel">
-          {cluster.articles.map(a => (
-            <article key={a.id} className="perspective-card">
-              <div className="perspective-publisher">
-                <div className="source-avatar sm" style={{ backgroundColor: BIAS_COLORS[biasOverrides[a.publisher_id] ?? a.publisher.bias_category] ?? "#8E8E93" }}>
-                  {a.publisher.logo_url && !logoErrors.has(a.id) ? <img src={a.publisher.logo_url} alt={a.publisher.name} onError={() => setLogoErrors(s => new Set(s).add(a.id))} /> : <span>{a.publisher.name.slice(0, 2).toUpperCase()}</span>}
-                </div>
-                <span>{a.publisher.name}</span>
-                <small>{formatDistanceToNow(new Date(a.published_at), { addSuffix: true })}</small>
+        <button
+          className="perspective-advanced-trigger"
+          onClick={() => setAdvancedTermsOpen(open => !open)}
+          aria-expanded={advancedTermsOpen}
+        >
+          {t(lang, "advanced")}
+          <ChevronDown size={15} className={advancedTermsOpen ? "open" : ""} />
+        </button>
+        <div className="perspective-groups">
+          {cluster.perspective_groups.map(group => (
+            <section key={group.bias_category} className="perspective-group">
+              <div className="perspective-group-header">
+                <span className="publisher-dot" style={{ background: BIAS_COLORS[group.bias_category] }} />
+                <strong>{t(lang, BIAS_I18N[group.bias_category])}</strong>
+                <small>{group.articles.length} {t(lang, group.articles.length === 1 ? "source" : "sources")}</small>
               </div>
-              <h3>{articleHeadline(a, lang)}</h3>
-              {a.snippet && <p>{decodeHTMLEntities(a.snippet)}</p>}
-              <button className="perspective-open" onClick={() => openArticle(a)}>
-                {t(lang, "openArticle")} <ChevronRight size={16} />
-              </button>
-            </article>
+              {advancedTermsOpen && group.common_terms.length > 0 && <p className="term-line"><b>{t(lang, "sharedTerms")}:</b> {group.common_terms.join(", ")}</p>}
+              {advancedTermsOpen && group.distinct_terms.length > 0 && <p className="term-line"><b>{t(lang, "distinctTerms")}:</b> {group.distinct_terms.join(", ")}</p>}
+              {group.articles.map(item => {
+                const article = cluster.articles.find(candidate => candidate.id === item.article_id);
+                if (!article) return null;
+                return (
+                  <button key={item.article_id} className="comparison-row" onClick={() => openArticle(article)}>
+                    <span><strong>{item.publisher_name}</strong><small>{formatDistanceToNow(new Date(item.published_at), { addSuffix: true })}</small></span>
+                    <p>{articleHeadline(article, lang)}</p>
+                    <ChevronRight size={16} />
+                  </button>
+                );
+              })}
+            </section>
           ))}
         </div>
 
@@ -573,6 +646,7 @@ export function StoryDetailScreen({
                       {i === 0 && <span className="timeline-first"> · {t(lang, "brokeTheStory")}</span>}
                     </span>
                     <span className="timeline-time">{formatDistanceToNow(new Date(a.published_at), { addSuffix: true })}</span>
+                    <span className="timeline-headline">{articleHeadline(a, lang)}</span>
                   </div>
                 </div>
               ))}
@@ -641,7 +715,7 @@ const GROUPING_I18N: Record<ReturnType<typeof groupingEvidence>["level"], import
 };
 
 export type FeedFilter = "local" | "global";
-type FeedSort = "balanced" | "latest" | "covered";
+type FeedSort = "balanced" | "latest" | "covered" | "blindspots";
 type FeedRootView = "feed" | "blindspots" | "saved";
 
 const INDEPENDENT_BIAS: BiasCategory[] = ["commercial_independent", "investigative_independent"];
@@ -671,43 +745,60 @@ export function FeedScreen({
   const localDisabledPublisherIds = useAppStore(s => s.localDisabledPublisherIds);
   const globalDisabledPublisherIds = useAppStore(s => s.globalDisabledPublisherIds);
   const biasOverrides = useAppStore(s => s.publisherBiasOverrides);
-  const savedClusterIds = useAppStore(s => s.savedClusterIds);
+  const savedStoryKeys = useAppStore(s => s.savedStoryKeys);
+  const setStorySaved = useAppStore(s => s.setStorySaved);
+  const replaceSavedStoryKeys = useAppStore(s => s.replaceSavedStoryKeys);
+  const legacySavedClusterIds = useAppStore(s => s.legacySavedClusterIds);
+  const clearLegacySavedClusterIds = useAppStore(s => s.clearLegacySavedClusterIds);
   const queryClient = useQueryClient();
   const { data, isLoading, isError, refetch } = useClusters();
+  const { data: savedData, refetch: refetchSaved } = useSavedStories();
   const { data: publishers = [], isLoading: publishersLoading } = usePublishers();
   const [refreshing, setRefreshing] = useState(false);
-  const [shuffleKey, setShuffleKey] = useState(0);
   const [activeCategory, setActiveCategory] = useState<"all" | Category>("all");
   const [feedSort, setFeedSort] = useState<FeedSort>("balanced");
   const [filtersOpen, setFiltersOpen] = useState(false);
   const [failedSources, setFailedSources] = useState<string[]>([]);
   const [refreshError, setRefreshError] = useState<string | null>(null);
   const [dismissedIds, setDismissedIds] = useState<Set<string>>(new Set());
+  const [searchQuery, setSearchQuery] = useState("");
+  const [searchResult, setSearchResult] = useState<StoryCluster[] | null>(null);
+  const [searching, setSearching] = useState(false);
+  const [lastRefreshLabel, setLastRefreshLabel] = useState<string>("");
+  const [diagnosticsOpen, setDiagnosticsOpen] = useState(false);
 
-  const rawClusters = useMemo(() => data?.clusters ?? [], [data?.clusters]);
+  useEffect(() => {
+    if (savedData) {
+      replaceSavedStoryKeys(savedData.clusters.map(cluster => cluster.story_key));
+    }
+  }, [replaceSavedStoryKeys, savedData]);
+
+  useEffect(() => {
+    if (!data || legacySavedClusterIds.length === 0) return;
+    const legacyIds = new Set(legacySavedClusterIds);
+    const clustersToMigrate = data.clusters.filter(cluster => legacyIds.has(cluster.id));
+    Promise.all(
+      clustersToMigrate.map(cluster =>
+        saveStory(cluster.story_key, cluster.articles.map(article => article.id))
+      ),
+    )
+      .then(async () => {
+        clearLegacySavedClusterIds();
+        await refetchSaved();
+      })
+      .catch(err => console.error("saved story migration failed", err));
+  }, [clearLegacySavedClusterIds, data, legacySavedClusterIds, refetchSaved]);
+
+  const rawClusters = useMemo(
+    () => searchResult ?? (rootView === "saved" ? savedData?.clusters ?? [] : data?.clusters ?? []),
+    [data?.clusters, rootView, savedData?.clusters, searchResult],
+  );
   const enabledPublisherCount = useMemo(() => {
     const disabled = filter === "local" ? localDisabledPublisherIds : globalDisabledPublisherIds;
     return publishers.filter(p => (filter === "local" ? !p.is_global : p.is_global) && !disabled.includes(p.id)).length;
   }, [publishers, filter, localDisabledPublisherIds, globalDisabledPublisherIds]);
 
-  // Pin shuffle scores in a ref — only recompute when shuffleKey changes.
-  const shuffleScores = useRef<Map<string, number>>(new Map());
-  const prevShuffleKey = useRef(-1);
-
   const clusters = useMemo(() => {
-    // Recompute scores only on explicit refresh.
-    if (shuffleKey !== prevShuffleKey.current) {
-      prevShuffleKey.current = shuffleKey;
-      shuffleScores.current = new Map(
-        rawClusters.map(c => {
-          let h = shuffleKey;
-          for (let i = 0; i < c.id.length; i++) h = (h * 31 + c.id.charCodeAt(i)) | 0;
-          const rand = ((h >>> 0) % 1000) / 1000;
-          return [c.id, Math.log(1 + c.articles.length) + rand * 2];
-        })
-      );
-    }
-
     let arr = [...rawClusters];
 
     // Restrict each cluster to articles matching the active tab's locality,
@@ -728,10 +819,10 @@ export function FeedScreen({
       })
       .filter(c => c.articles.length > 0);
 
-    if (rootView === "saved") {
-      arr = arr.filter(c => savedClusterIds.includes(c.id));
-    } else if (rootView === "blindspots") {
+    if (rootView === "blindspots") {
       arr = arr.filter(c => c.is_blindspot);
+    } else if (rootView === "saved") {
+      arr = arr.filter(c => savedStoryKeys.includes(c.story_key));
     }
 
     // Apply category filter.
@@ -743,13 +834,57 @@ export function FeedScreen({
       arr.sort((a, b) => b.last_updated.localeCompare(a.last_updated));
     } else if (feedSort === "covered") {
       arr.sort((a, b) => b.articles.length - a.articles.length || b.last_updated.localeCompare(a.last_updated));
+    } else if (feedSort === "blindspots") {
+      arr.sort((a, b) => Number(b.is_blindspot) - Number(a.is_blindspot) || b.last_updated.localeCompare(a.last_updated));
     } else {
-      arr.sort((a, b) =>
-        (shuffleScores.current.get(b.id) ?? 0) - (shuffleScores.current.get(a.id) ?? 0)
-      );
+      const score = (cluster: StoryCluster) => {
+        const publisherCount = new Set(cluster.articles.map(a => a.publisher_id)).size;
+        const freshnessHours = Math.max(0, (Date.now() - new Date(cluster.last_updated).getTime()) / 3_600_000);
+        const freshness = 1 - Math.min(freshnessHours, 72) / 72;
+        const independentCoverage = cluster.blindspot_explanation.missing_independent_coverage ? 0 : 1;
+        return freshness * 0.45 + Math.min(publisherCount, 4) / 4 * 0.35 + independentCoverage * 0.15 + Number(cluster.is_blindspot) * 0.05;
+      };
+      arr.sort((a, b) => score(b) - score(a) || b.last_updated.localeCompare(a.last_updated));
     }
     return arr;
-  }, [rawClusters, shuffleKey, activeCategory, feedSort, rootView, savedClusterIds, filter, localDisabledPublisherIds, globalDisabledPublisherIds, biasOverrides]);
+  }, [rawClusters, activeCategory, feedSort, rootView, filter, localDisabledPublisherIds, globalDisabledPublisherIds, biasOverrides, savedStoryKeys]);
+
+  useEffect(() => {
+    let cancelled = false;
+    const q = searchQuery.trim();
+    if (!q) {
+      setSearchResult(null);
+      setSearching(false);
+      return;
+    }
+    setSearching(true);
+    const timer = window.setTimeout(async () => {
+      try {
+        const result = await searchStories(q);
+        if (!cancelled) setSearchResult(result.clusters);
+      } catch (err) {
+        console.error("search failed", err);
+        if (!cancelled) setSearchResult([]);
+      } finally {
+        if (!cancelled) setSearching(false);
+      }
+    }, 250);
+    return () => {
+      cancelled = true;
+      window.clearTimeout(timer);
+    };
+  }, [searchQuery]);
+
+  useEffect(() => {
+    getRefreshStatus()
+      .then(status => {
+        if (status.last_refresh_at) {
+          setLastRefreshLabel(formatDistanceToNow(new Date(status.last_refresh_at), { addSuffix: true }));
+        }
+        if (status.failed_sources.length > 0) setFailedSources(status.failed_sources);
+      })
+      .catch(() => undefined);
+  }, []);
 
   const handleRefresh = useCallback(async () => {
     setRefreshing(true);
@@ -762,12 +897,32 @@ export function FeedScreen({
       }
       await queryClient.invalidateQueries({ queryKey: clusterKeys.all() });
       await refetch();
+      await refetchSaved();
+      const status = await getRefreshStatus().catch(() => null);
+      if (status?.last_refresh_at) setLastRefreshLabel(formatDistanceToNow(new Date(status.last_refresh_at), { addSuffix: true }));
     } catch (e) {
       console.error("refresh failed:", e);
       setRefreshError(errorMessage(e));
     }
-    finally { setShuffleKey(k => k + 1); setRefreshing(false); }
-  }, [queryClient, refetch]);
+    finally { setRefreshing(false); }
+  }, [queryClient, refetch, refetchSaved]);
+
+  const toggleSaved = useCallback(async (cluster: StoryCluster) => {
+    const currentlySaved = savedStoryKeys.includes(cluster.story_key);
+    setStorySaved(cluster.story_key, !currentlySaved);
+    try {
+      if (currentlySaved) {
+        await unsaveStory(cluster.story_key);
+      } else {
+        await saveStory(cluster.story_key, cluster.articles.map(article => article.id));
+      }
+      await queryClient.invalidateQueries({ queryKey: clusterKeys.all() });
+      await refetchSaved();
+    } catch (err) {
+      setStorySaved(cluster.story_key, currentlySaved);
+      setRefreshError(errorMessage(err));
+    }
+  }, [queryClient, refetchSaved, savedStoryKeys, setStorySaved]);
 
   const { containerRef, pullDistance, refreshing: pullRefreshing, progress } = usePullToRefresh(
     handleRefresh, !isLoading && !refreshing && rawClusters.length > 0,
@@ -833,7 +988,7 @@ export function FeedScreen({
         <header className="feed-header">
           <div>
             <p className="feed-eyebrow">Merill</p>
-            <h1>{rootView === "saved" ? t(lang, "tabSaved") : rootView === "blindspots" ? t(lang, "tabBlindspots") : t(lang, "topStories")}</h1>
+        <h1>{searchQuery ? t(lang, "searchResults") : rootView === "saved" ? t(lang, "tabSaved") : rootView === "blindspots" ? t(lang, "tabBlindspots") : t(lang, "topStories")}</h1>
           </div>
         </header>
         <div className="feed-scope segmented-control" role="group" aria-label={t(lang, "feedScope")}>
@@ -851,7 +1006,11 @@ export function FeedScreen({
           </div>
           <p className="empty-title">{emptyTitle}</p>
           <p className="empty-sub">{emptySub}</p>
-          {enabledPublisherCount === 0 ? (
+          {searchQuery ? (
+            <button onClick={() => setSearchQuery("")} className="primary-btn">
+              {t(lang, "clearSearch")}
+            </button>
+          ) : enabledPublisherCount === 0 ? (
             <button onClick={onOpenSettings} className="primary-btn">
               {t(lang, "openSettings")}
             </button>
@@ -909,12 +1068,43 @@ export function FeedScreen({
       <header className="feed-header">
         <div>
           <p className="feed-eyebrow">Merill</p>
-          <h1>{rootView === "saved" ? t(lang, "tabSaved") : rootView === "blindspots" ? t(lang, "tabBlindspots") : t(lang, "topStories")}</h1>
+          <h1>{searchQuery ? t(lang, "searchResults") : rootView === "saved" ? t(lang, "tabSaved") : rootView === "blindspots" ? t(lang, "tabBlindspots") : t(lang, "topStories")}</h1>
+          {lastRefreshLabel && <small className="refresh-status-label">{t(lang, "lastUpdated")} {lastRefreshLabel}</small>}
         </div>
-        <button className={`header-filter-btn${filtersOpen ? " active" : ""}`} onClick={() => setFiltersOpen(open => !open)} aria-label={t(lang, "filters")} aria-expanded={filtersOpen}>
-          <Filter size={18} />
-        </button>
+        <div className="feed-header-actions">
+          {(failedSources.length > 0 || refreshError) && (
+            <button className={`header-filter-btn${diagnosticsOpen ? " active" : ""}`} onClick={() => setDiagnosticsOpen(open => !open)} aria-label={t(lang, "sourceDiagnostics")} aria-expanded={diagnosticsOpen}>
+              <Info size={18} />
+            </button>
+          )}
+          <button className={`header-filter-btn${filtersOpen ? " active" : ""}`} onClick={() => setFiltersOpen(open => !open)} aria-label={t(lang, "filters")} aria-expanded={filtersOpen}>
+            <Filter size={18} />
+          </button>
+        </div>
       </header>
+      <div className="feed-search">
+        <Search size={16} />
+        <input value={searchQuery} onChange={event => setSearchQuery(event.target.value)} placeholder={t(lang, "searchPlaceholder")} />
+        {searching ? <div className="mini-spinner" /> : searchQuery && <button onClick={() => setSearchQuery("")} aria-label={t(lang, "clearSearch")}><X size={15} /></button>}
+      </div>
+      {diagnosticsOpen && (
+        <div className="source-diagnostics">
+          <strong>{t(lang, "sourceDiagnostics")}</strong>
+          {refreshError && <p>{t(lang, "refreshError")}</p>}
+          {failedSources.map(source => (
+            <div key={source} className="source-diagnostic-row">
+              <span>{source}</span>
+              <button onClick={() => {
+                const publisher = publishers.find(p => p.id === source || p.name === source);
+                if (!publisher) return;
+                if (publisher.is_global) useAppStore.getState().toggleGlobalPublisher(publisher.id);
+                else useAppStore.getState().toggleLocalPublisher(publisher.id);
+              }}>{t(lang, "disableSource")}</button>
+            </div>
+          ))}
+          <button className="inline-add-trigger" onClick={handleRefresh}>{t(lang, "retrySources")}</button>
+        </div>
+      )}
       <div className="feed-scope segmented-control" role="group" aria-label={t(lang, "feedScope")}>
         {(["local", "global"] as const).map(scope => (
           <button key={scope} data-active={filter === scope} aria-pressed={filter === scope} onClick={() => onFilterChange(scope)}>
@@ -926,7 +1116,7 @@ export function FeedScreen({
         <div className="feed-filter-panel">
           <span>{t(lang, "feedSort")}</span>
           <div className="filter-options">
-            {([["balanced", "sortBalanced"], ["latest", "sortLatest"], ["covered", "sortCovered"]] as const).map(([value, label]) => (
+            {([["balanced", "sortBalanced"], ["latest", "sortLatest"], ["covered", "sortCovered"], ["blindspots", "sortBlindspots"]] as const).map(([value, label]) => (
               <button key={value} data-active={feedSort === value} onClick={() => { setFeedSort(value); setFiltersOpen(false); }}>
                 {t(lang, label)} {feedSort === value && <Check size={15} />}
               </button>
@@ -960,6 +1150,8 @@ export function FeedScreen({
             <StoryCard
               cluster={c}
               onPress={onSelectCluster}
+              isSaved={savedStoryKeys.includes(c.story_key)}
+              onToggleSaved={toggleSaved}
               onDismiss={(id) => setDismissedIds(s => new Set(s).add(id))}
               animationDelay={`${Math.min(i * 0.05, 0.3)}s`}
             />

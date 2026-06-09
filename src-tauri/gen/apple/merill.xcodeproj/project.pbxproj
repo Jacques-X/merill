@@ -17,6 +17,7 @@
 		5501A1090F5AC4071D09EF57 /* LaunchScreen.storyboard in Resources */ = {isa = PBXBuildFile; fileRef = B56892EC680E1CBA11636294 /* LaunchScreen.storyboard */; };
 		57A6F4D2626D6A05A30C3C56 /* MerillModels.swift in Sources */ = {isa = PBXBuildFile; fileRef = 8AAB0E5E8CD23937F2E9ED57 /* MerillModels.swift */; };
 		5F81979E3663AB79B76863EF /* NativeGlass.swift in Sources */ = {isa = PBXBuildFile; fileRef = 16C8EB30BB277FC18144C533 /* NativeGlass.swift */; };
+		63F336CC76FCEC8AB8AA1F01 /* AIEmbedding.swift in Sources */ = {isa = PBXBuildFile; fileRef = 33B88D493CE3A2AB6B824C10 /* AIEmbedding.swift */; };
 		6FE5AF8702AA245D7537481F /* Assets.xcassets in Resources */ = {isa = PBXBuildFile; fileRef = 611CE169AB2B665E319056C1 /* Assets.xcassets */; };
 		7668AA32664C8CBE590E8D13 /* MerillApp.swift in Sources */ = {isa = PBXBuildFile; fileRef = 100B2414786AF7AB6BFC3602 /* MerillApp.swift */; };
 		7AC31BD0F120984F26831387 /* MerillLocalization.swift in Sources */ = {isa = PBXBuildFile; fileRef = 7206F74F8F46BD4E531A0DAE /* MerillLocalization.swift */; };
@@ -35,6 +36,7 @@
 		D06B32CAC1A3D4BC3C702877 /* Metal.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 25EBB16E7B3D07275C1177FB /* Metal.framework */; };
 		DB836DD77674B0637F257B48 /* MetalKit.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = A5CFA6DA21C0A19D77A35198 /* MetalKit.framework */; };
 		E69B3EAAD618E07A27EAA88C /* FeedViews.swift in Sources */ = {isa = PBXBuildFile; fileRef = 60D5B59A0ACF2EE575A96B95 /* FeedViews.swift */; };
+		E9732CE4D9BFEB7A7CC4DEBB /* Carbon.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 0B3E285AC414B5415ACC9458 /* Carbon.framework */; };
 		F0DE5C8ED3394F34D0488EFC /* MerillApp.swift in Sources */ = {isa = PBXBuildFile; fileRef = 100B2414786AF7AB6BFC3602 /* MerillApp.swift */; };
 		F6BC9E3BFB625CA9E4E15905 /* NativeGlass.swift in Sources */ = {isa = PBXBuildFile; fileRef = 16C8EB30BB277FC18144C533 /* NativeGlass.swift */; };
 		FC29168EE9E620D1AE8CFAF1 /* StoryViews.swift in Sources */ = {isa = PBXBuildFile; fileRef = EEC3F87F8D60BF76B07F24E6 /* StoryViews.swift */; };
@@ -46,6 +48,7 @@
 		057D58AB994AC5E39DB80ACB /* models.rs */ = {isa = PBXFileReference; path = models.rs; sourceTree = "<group>"; };
 		07904869291C75A2A281CCB2 /* WebKit.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = WebKit.framework; path = System/Library/Frameworks/WebKit.framework; sourceTree = SDKROOT; };
 		079A799F612DE13334A55784 /* AISummary.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AISummary.swift; sourceTree = "<group>"; };
+		0B3E285AC414B5415ACC9458 /* Carbon.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = Carbon.framework; path = System/Library/Frameworks/Carbon.framework; sourceTree = SDKROOT; };
 		0E5BBB006FF5F4FA93134838 /* merill_iOS.entitlements */ = {isa = PBXFileReference; lastKnownFileType = text.plist.entitlements; path = merill_iOS.entitlements; sourceTree = "<group>"; };
 		100B2414786AF7AB6BFC3602 /* MerillApp.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MerillApp.swift; sourceTree = "<group>"; };
 		16C8EB30BB277FC18144C533 /* NativeGlass.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NativeGlass.swift; sourceTree = "<group>"; };
@@ -53,6 +56,7 @@
 		2557B0DD29F58D0ECE9BD30F /* translate.rs */ = {isa = PBXFileReference; path = translate.rs; sourceTree = "<group>"; };
 		25EBB16E7B3D07275C1177FB /* Metal.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = Metal.framework; path = System/Library/Frameworks/Metal.framework; sourceTree = SDKROOT; };
 		308836B60070BE71586C5886 /* pipeline.rs */ = {isa = PBXFileReference; path = pipeline.rs; sourceTree = "<group>"; };
+		33B88D493CE3A2AB6B824C10 /* AIEmbedding.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AIEmbedding.swift; sourceTree = "<group>"; };
 		38DD1553DFA0BD5832A19291 /* CoreGraphics.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = CoreGraphics.framework; path = System/Library/Frameworks/CoreGraphics.framework; sourceTree = SDKROOT; };
 		3B2F7BB89588D4C34B691DF3 /* RustClient.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RustClient.swift; sourceTree = "<group>"; };
 		4725A1FE8E5215037EE3E249 /* SettingsViews.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SettingsViews.swift; sourceTree = "<group>"; };
@@ -75,6 +79,7 @@
 		8E729D5ED409A6F2C9B5DD8D /* MerillAppModel.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MerillAppModel.swift; sourceTree = "<group>"; };
 		9F3470796A6C24D8680EE63B /* QuartzCore.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = QuartzCore.framework; path = System/Library/Frameworks/QuartzCore.framework; sourceTree = SDKROOT; };
 		A5CFA6DA21C0A19D77A35198 /* MetalKit.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = MetalKit.framework; path = System/Library/Frameworks/MetalKit.framework; sourceTree = SDKROOT; };
+		AC795A5D4400F1FD95887849 /* semantic_clustering.rs */ = {isa = PBXFileReference; path = semantic_clustering.rs; sourceTree = "<group>"; };
 		B56892EC680E1CBA11636294 /* LaunchScreen.storyboard */ = {isa = PBXFileReference; lastKnownFileType = file.storyboard; path = LaunchScreen.storyboard; sourceTree = "<group>"; };
 		C75CF159A6802BDB4CF1D2E0 /* native_bridge.rs */ = {isa = PBXFileReference; path = native_bridge.rs; sourceTree = "<group>"; };
 		EEC3F87F8D60BF76B07F24E6 /* StoryViews.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = StoryViews.swift; sourceTree = "<group>"; };
@@ -83,6 +88,14 @@
 /* End PBXFileReference section */
 
 /* Begin PBXFrameworksBuildPhase section */
+		14FEB990A2FE3A167DDA97AD /* Frameworks */ = {
+			isa = PBXFrameworksBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				E9732CE4D9BFEB7A7CC4DEBB /* Carbon.framework in Frameworks */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
 		16EE6F05262D17EF11D5053B /* Frameworks */ = {
 			isa = PBXFrameworksBuildPhase;
 			buildActionMask = 2147483647;
@@ -116,6 +129,7 @@
 				308836B60070BE71586C5886 /* pipeline.rs */,
 				202BAFA15262D929DF2034A9 /* publishers.rs */,
 				82CB370E69BE53C99E4C9F13 /* scraper.rs */,
+				AC795A5D4400F1FD95887849 /* semantic_clustering.rs */,
 				2557B0DD29F58D0ECE9BD30F /* translate.rs */,
 			);
 			name = src;
@@ -125,6 +139,7 @@
 		6AD8DC7295C934001AADCF88 /* Frameworks */ = {
 			isa = PBXGroup;
 			children = (
+				0B3E285AC414B5415ACC9458 /* Carbon.framework */,
 				38DD1553DFA0BD5832A19291 /* CoreGraphics.framework */,
 				FC9CD5FCAC055227FD71D68A /* CoreML.framework */,
 				857CC6138F07A87E2A9AAF9E /* libapp.a */,
@@ -157,6 +172,7 @@
 		CC1426D5EB9D005378BC4938 /* Sources */ = {
 			isa = PBXGroup;
 			children = (
+				33B88D493CE3A2AB6B824C10 /* AIEmbedding.swift */,
 				079A799F612DE13334A55784 /* AISummary.swift */,
 			);
 			path = Sources;
@@ -204,18 +220,18 @@
 			name = Products;
 			sourceTree = "<group>";
 		};
-		"TEMP_3AA0D83C-8C69-4003-B64D-9940675EE0CB" /* arm64 */ = {
-			isa = PBXGroup;
-			children = (
-			);
-			path = arm64;
-			sourceTree = "<group>";
-		};
-		"TEMP_98A095F3-EA99-49C8-B2A8-472EE3DC64AB" /* x86_64 */ = {
+		"TEMP_6E53EC60-7596-4B4A-A03D-D23795C14129" /* x86_64 */ = {
 			isa = PBXGroup;
 			children = (
 			);
 			path = x86_64;
+			sourceTree = "<group>";
+		};
+		"TEMP_A98E9201-E5F2-4C98-BF78-86DE5FC3E9DB" /* arm64 */ = {
+			isa = PBXGroup;
+			children = (
+			);
+			path = arm64;
 			sourceTree = "<group>";
 		};
 /* End PBXGroup section */
@@ -249,6 +265,7 @@
 				38DC6320262509617772D2AE /* Build Rust Code */,
 				D12CD478E1FA7AE4C6F3C4BD /* Sources */,
 				A15E85A1D8BBDF6BEFEB0419 /* Resources */,
+				14FEB990A2FE3A167DDA97AD /* Frameworks */,
 			);
 			buildRules = (
 			);
@@ -359,10 +376,11 @@
 			);
 			outputPaths = (
 				"$(SRCROOT)/../../target/debug/libapp_lib.a",
+				"$(SRCROOT)/../../target/release/libapp_lib.a",
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 			shellPath = /bin/sh;
-			shellScript = "cd ../.. && cargo build";
+			shellScript = "cd ../..\nif [ \"${CONFIGURATION}\" = \"release\" ]; then\n  cargo build --release\nelse\n  cargo build\nfi\n";
 		};
 /* End PBXShellScriptBuildPhase section */
 
@@ -387,6 +405,7 @@
 			isa = PBXSourcesBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
+				63F336CC76FCEC8AB8AA1F01 /* AIEmbedding.swift in Sources */,
 				00D5AA4ACC56589DA0D1CC5B /* AISummary.swift in Sources */,
 				4C5C5F7234FCBB05F0CCF96D /* FeedViews.swift in Sources */,
 				F0DE5C8ED3394F34D0488EFC /* MerillApp.swift in Sources */,
@@ -555,7 +574,7 @@
 					"$(inherited)",
 					"@executable_path/../Frameworks",
 				);
-				OTHER_LDFLAGS = "$(inherited) $(PROJECT_DIR)/../../target/debug/libapp_lib.a";
+				OTHER_LDFLAGS = "$(inherited) $(PROJECT_DIR)/../../target/release/libapp_lib.a";
 				PRODUCT_BUNDLE_IDENTIFIER = mt.merill.app;
 				PRODUCT_NAME = Merill;
 				SDKROOT = macosx;

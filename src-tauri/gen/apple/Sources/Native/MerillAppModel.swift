@@ -4,6 +4,8 @@ import SwiftUI
 @MainActor
 final class MerillAppModel: ObservableObject {
     @Published private(set) var clusters: [StoryCluster] = []
+    @Published private(set) var savedClusters: [StoryCluster] = []
+    @Published private(set) var searchResults: [StoryCluster] = []
     @Published private(set) var publishers: [Publisher] = []
     @Published private(set) var failedSources: [String] = []
     @Published var isLoading = false
@@ -13,8 +15,8 @@ final class MerillAppModel: ObservableObject {
     @Published var scope: FeedScope {
         didSet { defaults.set(scope.rawValue, forKey: Keys.scope) }
     }
-    @Published var savedClusterIds: Set<String> {
-        didSet { defaults.set(Array(savedClusterIds), forKey: Keys.saved) }
+    @Published var savedStoryKeys: Set<String> {
+        didSet { defaults.set(Array(savedStoryKeys), forKey: Keys.saved) }
     }
     @Published var disabledLocalPublisherIds: Set<String> {
         didSet { defaults.set(Array(disabledLocalPublisherIds), forKey: Keys.disabledLocal) }
@@ -25,11 +27,23 @@ final class MerillAppModel: ObservableObject {
     @Published var readerScale: ReaderScale {
         didSet { defaults.set(readerScale.rawValue, forKey: Keys.readerScale) }
     }
+    @Published var readerLineSpacing: ReaderLineSpacing {
+        didSet { defaults.set(readerLineSpacing.rawValue, forKey: Keys.readerLineSpacing) }
+    }
+    @Published var readerTextMode: ReaderTextMode {
+        didSet { defaults.set(readerTextMode.rawValue, forKey: Keys.readerTextMode) }
+    }
+    @Published var feedSort: FeedSort {
+        didSet { defaults.set(feedSort.rawValue, forKey: Keys.feedSort) }
+    }
+    @Published var onboardingComplete: Bool {
+        didSet { defaults.set(onboardingComplete, forKey: Keys.onboardingComplete) }
+    }
+    @Published var searchText = ""
+    @Published private(set) var lastRefreshAt: Date?
     @Published var language: String {
         didSet { defaults.set(language, forKey: Keys.language) }
     }
-    @Published private var feedOrderSeed = UInt64(Date().timeIntervalSince1970)
-
     private let defaults = UserDefaults.standard
     private let client = RustClient.shared
     private var translationCache: [String: String] = [:]
@@ -40,6 +54,10 @@ final class MerillAppModel: ObservableObject {
         static let disabledLocal = "merill.native.disabledLocalPublisherIds"
         static let biasOverrides = "merill.native.biasOverrides"
         static let readerScale = "merill.native.readerScale"
+        static let readerLineSpacing = "merill.native.readerLineSpacing"
+        static let readerTextMode = "merill.native.readerTextMode"
+        static let feedSort = "merill.native.feedSort"
+        static let onboardingComplete = "merill.native.onboardingComplete"
         static let language = "merill.native.language"
         static let clusteringVersion = "merill.native.clusteringVersion"
     }
@@ -48,11 +66,15 @@ final class MerillAppModel: ObservableObject {
 
     init() {
         scope = FeedScope(rawValue: defaults.string(forKey: Keys.scope) ?? "") ?? .local
-        savedClusterIds = Set(defaults.stringArray(forKey: Keys.saved) ?? [])
+        savedStoryKeys = Set(defaults.stringArray(forKey: Keys.saved) ?? [])
         disabledLocalPublisherIds = Set(defaults.stringArray(forKey: Keys.disabledLocal) ?? [])
         let storedBiases = defaults.dictionary(forKey: Keys.biasOverrides) as? [String: String] ?? [:]
         biasOverrides = storedBiases.compactMapValues(BiasCategory.init(rawValue:))
         readerScale = ReaderScale(rawValue: defaults.string(forKey: Keys.readerScale) ?? "") ?? .medium
+        readerLineSpacing = ReaderLineSpacing(rawValue: defaults.string(forKey: Keys.readerLineSpacing) ?? "") ?? .comfortable
+        readerTextMode = ReaderTextMode(rawValue: defaults.string(forKey: Keys.readerTextMode) ?? "") ?? .translated
+        feedSort = FeedSort(rawValue: defaults.string(forKey: Keys.feedSort) ?? "") ?? .balanced
+        onboardingComplete = defaults.bool(forKey: Keys.onboardingComplete)
         language = defaults.string(forKey: Keys.language) ?? "en"
     }
 
@@ -78,7 +100,27 @@ final class MerillAppModel: ObservableObject {
         async let clusterResponse: ClustersResponse = client.call("get_clusters", payload: ["blindspots_only": false])
         async let publisherResponse: [Publisher] = client.call("get_publishers")
         clusters = try await clusterResponse.clusters
+        try await migrateLegacySavedClusters()
+        let savedResponse: ClustersResponse = try await client.call("get_saved_stories")
+        savedClusters = savedResponse.clusters
+        savedStoryKeys = Set(savedClusters.map(\.storyKey))
         publishers = try await publisherResponse
+        await reloadRefreshStatus()
+    }
+
+    private func migrateLegacySavedClusters() async throws {
+        let legacyIds = savedStoryKeys.filter { !$0.hasPrefix("story_") }
+        guard !legacyIds.isEmpty else { return }
+
+        var migratedKeys = savedStoryKeys.subtracting(legacyIds)
+        for cluster in clusters where legacyIds.contains(cluster.id) {
+            try await client.callVoid("save_story", payload: [
+                "story_key": cluster.storyKey,
+                "article_ids": cluster.articles.map(\.id),
+            ])
+            migratedKeys.insert(cluster.storyKey)
+        }
+        savedStoryKeys = migratedKeys
     }
 
     func refresh() async throws {
@@ -89,7 +131,6 @@ final class MerillAppModel: ObservableObject {
             let result: RefreshResult = try await client.call("refresh_feed")
             failedSources = result.failedSources
             try await reload()
-            feedOrderSeed &+= 1
         } catch {
             errorMessage = error.localizedDescription
             throw error
@@ -97,12 +138,15 @@ final class MerillAppModel: ObservableObject {
     }
 
     func clusters(for tab: RootTab, topic: String?) -> [StoryCluster] {
-        let filtered = clusters
+        let source = searchText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            ? (tab == .saved ? savedClusters : clusters)
+            : searchResults
+        let filtered = source
             .filter { cluster in
                 switch tab {
                 case .feed: return true
                 case .blindspots: return cluster.isBlindspot
-                case .saved: return savedClusterIds.contains(cluster.id)
+                case .saved: return savedStoryKeys.contains(cluster.storyKey)
                 case .settings: return false
                 }
             }
@@ -119,13 +163,21 @@ final class MerillAppModel: ObservableObject {
                 return cluster.articles.contains { $0.category == topic }
             }
 
-        if tab == .feed {
+        switch feedSort {
+        case .latest:
+            return filtered.sorted { $0.lastUpdatedDate > $1.lastUpdatedDate }
+        case .covered:
             return filtered.sorted {
-                balancedFeedScore(for: $0) > balancedFeedScore(for: $1)
+                Set($0.articles.map(\.publisherId)).count > Set($1.articles.map(\.publisherId)).count
             }
+        case .blindspots:
+            return filtered.sorted {
+                if $0.isBlindspot != $1.isBlindspot { return $0.isBlindspot }
+                return $0.lastUpdatedDate > $1.lastUpdatedDate
+            }
+        case .balanced:
+            return filtered.sorted { balancedFeedScore(for: $0) > balancedFeedScore(for: $1) }
         }
-
-        return filtered.sorted { $0.lastUpdatedDate > $1.lastUpdatedDate }
     }
 
     private func balancedFeedScore(for cluster: StoryCluster) -> Double {
@@ -133,28 +185,62 @@ final class MerillAppModel: ObservableObject {
         let coverage = min(Double(publisherCount), 4) / 4
         let ageHours = max(0, -cluster.lastUpdatedDate.timeIntervalSinceNow / 3_600)
         let freshness = 1 - min(ageHours, 72) / 72
-        return coverage * 0.5 + freshness * 0.75 + stableFeedRandom(for: cluster.id) * 1.5
-    }
-
-    private func stableFeedRandom(for clusterID: String) -> Double {
-        var hash: UInt64 = 1_469_598_103_934_665_603 ^ feedOrderSeed
-        for byte in clusterID.utf8 {
-            hash ^= UInt64(byte)
-            hash &*= 1_099_511_628_211
-        }
-        return Double(hash % 10_000) / 10_000
+        let independent = cluster.blindspotExplanation.missingIndependentCoverage ? 0.0 : 1.0
+        return coverage * 0.35 + freshness * 0.45 + independent * 0.15 + (cluster.isBlindspot ? 0.05 : 0)
     }
 
     func toggleSaved(_ cluster: StoryCluster) {
-        if savedClusterIds.contains(cluster.id) {
-            savedClusterIds.remove(cluster.id)
+        let wasSaved = savedStoryKeys.contains(cluster.storyKey)
+        if wasSaved {
+            savedStoryKeys.remove(cluster.storyKey)
         } else {
-            savedClusterIds.insert(cluster.id)
+            savedStoryKeys.insert(cluster.storyKey)
+        }
+        Task {
+            do {
+                if wasSaved {
+                    try await client.callVoid("unsave_story", payload: ["story_key": cluster.storyKey])
+                } else {
+                    try await client.callVoid("save_story", payload: [
+                        "story_key": cluster.storyKey,
+                        "article_ids": cluster.articles.map(\.id),
+                    ])
+                }
+                try await reload()
+            } catch {
+                if wasSaved { savedStoryKeys.insert(cluster.storyKey) }
+                else { savedStoryKeys.remove(cluster.storyKey) }
+                errorMessage = error.localizedDescription
+            }
         }
     }
 
     func isSaved(_ cluster: StoryCluster) -> Bool {
-        savedClusterIds.contains(cluster.id)
+        savedStoryKeys.contains(cluster.storyKey)
+    }
+
+    func search() async {
+        let query = searchText.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !query.isEmpty else {
+            searchResults = []
+            return
+        }
+        do {
+            let response: ClustersResponse = try await client.call("search_stories", payload: ["query": query])
+            searchResults = response.clusters
+        } catch {
+            errorMessage = error.localizedDescription
+        }
+    }
+
+    func reloadRefreshStatus() async {
+        do {
+            let status: RefreshStatus = try await client.call("get_refresh_status")
+            failedSources = status.failedSources
+            lastRefreshAt = status.lastRefreshAt.flatMap { ISO8601DateFormatter().date(from: $0) }
+        } catch {
+            // Status is supplemental; feed loading should still succeed.
+        }
     }
 
     func isPublisherEnabled(_ publisher: Publisher) -> Bool {

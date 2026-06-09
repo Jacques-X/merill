@@ -1,6 +1,6 @@
 import { useQuery } from "@tanstack/react-query";
 import { invoke } from "@tauri-apps/api/core";
-import type { ClustersResponse, RefreshResult, Publisher } from "@/types";
+import type { ClustersResponse, RefreshResult, RefreshStatus, Publisher } from "@/types";
 
 export const clusterKeys = {
   all: () => ["clusters"] as const,
@@ -21,6 +21,14 @@ export function useClusters() {
   });
 }
 
+export function useSavedStories(enabled = true) {
+  return useQuery({
+    queryKey: [...clusterKeys.all(), "saved"],
+    queryFn: () => invoke<ClustersResponse>("get_saved_stories"),
+    enabled,
+  });
+}
+
 export function usePublishers() {
   return useQuery({
     queryKey: ["publishers"],
@@ -31,6 +39,22 @@ export function usePublishers() {
 
 export async function refreshFeed(): Promise<RefreshResult> {
   return invoke<RefreshResult>("refresh_feed");
+}
+
+export async function searchStories(query: string): Promise<ClustersResponse> {
+  return invoke<ClustersResponse>("search_stories", { query });
+}
+
+export async function saveStory(storyKey: string, articleIds: string[]): Promise<void> {
+  return invoke<void>("save_story", { storyKey, articleIds });
+}
+
+export async function unsaveStory(storyKey: string): Promise<void> {
+  return invoke<void>("unsave_story", { storyKey });
+}
+
+export async function getRefreshStatus(): Promise<RefreshStatus> {
+  return invoke<RefreshStatus>("get_refresh_status");
 }
 
 export async function addCustomPublisher(url: string, name: string, isGlobal: boolean): Promise<Publisher> {

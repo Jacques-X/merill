@@ -8,6 +8,7 @@ use crate::clustering;
 use crate::db;
 use crate::models::RawArticle;
 use crate::scraper;
+use crate::semantic_clustering;
 use crate::translate;
 
 // ── Cluster text helpers ─────────────────────────────────────────────────────
@@ -397,6 +398,21 @@ fn process(
         Err(e) => { let _ = conn.execute_batch("ROLLBACK"); return Err(e); }
     }
 
+    drop(conn);
+    let clusters_created = match semantic_clustering::recluster(db, false) {
+        Ok(Some(count)) => {
+            log::info!("semantic clustering complete: {} clusters", count);
+            count
+        }
+        Ok(None) => clusters_created,
+        Err(error) => {
+            log::warn!(
+                "semantic clustering failed; retaining lexical clusters: {error:#}"
+            );
+            clusters_created
+        }
+    };
+
     Ok(PipelineResult {
         articles_scraped: scraped_count,
         articles_new: new_count,
@@ -407,6 +423,27 @@ fn process(
 
 /// Re-cluster every article already in the database without re-scraping.
 pub fn recluster_all(db: &Pool<SqliteConnectionManager>) -> Result<PipelineResult> {
+    match semantic_clustering::recluster(db, true) {
+        Ok(Some(clusters_created)) => {
+            log::info!(
+                "semantic force-reclustering complete: {} clusters",
+                clusters_created
+            );
+            return Ok(PipelineResult {
+                articles_scraped: 0,
+                articles_new: 0,
+                clusters_created,
+                failed_sources: Vec::new(),
+            });
+        }
+        Ok(None) => {}
+        Err(error) => {
+            log::warn!(
+                "semantic force-reclustering failed; using lexical fallback: {error:#}"
+            );
+        }
+    }
+
     let conn = db.get()?;
 
     db::wipe_clusters(&conn)?;

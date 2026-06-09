@@ -1,7 +1,8 @@
 import { useState, useEffect, useCallback, useRef, memo } from "react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { Bookmark, Eye, Newspaper, Settings } from "lucide-react";
+import { Bookmark, Check, ChevronRight, Eye, Newspaper, Settings } from "lucide-react";
 import { FeedScreen, SettingsScreen, StoryDetailScreen } from "@/screens";
+import { usePublishers } from "@/api/clusters";
 import { useAppStore, sessionBaseline } from "@/store/useAppStore";
 import { t } from "@/utils/i18n";
 import type { StoryCluster } from "@/types";
@@ -51,6 +52,75 @@ const BottomDock = memo(function BottomDock({
   );
 });
 
+function Onboarding() {
+  const [step, setStep] = useState(0);
+  const language = useAppStore(s => s.language);
+  const setLanguage = useAppStore(s => s.setLanguage);
+  const isLocalPublisherEnabled = useAppStore(s => s.isLocalPublisherEnabled);
+  const toggleLocalPublisher = useAppStore(s => s.toggleLocalPublisher);
+  const setOnboardingComplete = useAppStore(s => s.setOnboardingComplete);
+  const { data: publishers = [] } = usePublishers();
+  const localPublishers = publishers.filter(publisher => !publisher.is_global);
+
+  return (
+    <div className="onboarding-shell">
+      <div className="onboarding-progress" aria-label={`Step ${step + 1} of 3`}>
+        {[0, 1, 2].map(index => <span key={index} data-active={index <= step} />)}
+      </div>
+      {step === 0 && (
+        <section>
+          <p className="feed-eyebrow">Merill</p>
+          <h1>News across perspectives</h1>
+          <p>Choose the language Merill should use for headlines, summaries, and controls.</p>
+          <div className="onboarding-options">
+            {([["en", "English"], ["mt", "Malti"]] as const).map(([value, label]) => (
+              <button key={value} data-active={language === value} onClick={() => setLanguage(value)}>
+                {label}{language === value && <Check size={18} />}
+              </button>
+            ))}
+          </div>
+        </section>
+      )}
+      {step === 1 && (
+        <section>
+          <p className="feed-eyebrow">Sources</p>
+          <h1>Build your Malta feed</h1>
+          <p>Select the publishers you want included. You can change this at any time in Settings.</p>
+          <div className="onboarding-source-list">
+            {localPublishers.map(publisher => {
+              const enabled = isLocalPublisherEnabled(publisher.id);
+              return (
+                <button key={publisher.id} onClick={() => toggleLocalPublisher(publisher.id)} aria-pressed={enabled}>
+                  <span>{publisher.name}</span>
+                  <Check size={17} style={{ opacity: enabled ? 1 : 0 }} />
+                </button>
+              );
+            })}
+          </div>
+        </section>
+      )}
+      {step === 2 && (
+        <section>
+          <p className="feed-eyebrow">How Merill reads coverage</p>
+          <h1>Ownership is context</h1>
+          <p>Colors describe publisher ownership, not whether an article is true. A blindspot means Merill found coverage without an independent publisher in the story group.</p>
+          <div className="onboarding-explainer">
+            <div><span className="ownership-dot independent" /><strong>Independent</strong><small>Commercial or investigative outlets</small></div>
+            <div><span className="ownership-dot party" /><strong>Party-owned</strong><small>PL or PN media organisations</small></div>
+            <div><span className="ownership-dot state" /><strong>State-owned</strong><small>Publicly owned media</small></div>
+          </div>
+        </section>
+      )}
+      <button className="onboarding-next" onClick={() => {
+        if (step < 2) setStep(current => current + 1);
+        else setOnboardingComplete(true);
+      }}>
+        {step < 2 ? "Continue" : "Open Merill"} <ChevronRight size={18} />
+      </button>
+    </div>
+  );
+}
+
 function AppShell() {
   useThemeSync();
   const touchLastOpened = useAppStore(s => s.touchLastOpened);
@@ -58,6 +128,7 @@ function AppShell() {
   const setFeedScope = useAppStore(s => s.setFeedScope);
   const [selectedCluster, setSelectedCluster] = useState<StoryCluster | null>(null);
   const [activeTab, setActiveTab] = useState<RootTab>("feed");
+  const onboardingComplete = useAppStore(s => s.onboardingComplete);
   const detailInternalBack = useRef<(() => void) | null>(null);
 
   useEffect(() => {
@@ -91,6 +162,10 @@ function AppShell() {
       document.removeEventListener("touchend", onEnd);
     };
   }, [handleBack, selectedCluster]);
+
+  if (!onboardingComplete) {
+    return <Onboarding />;
+  }
 
   if (selectedCluster) {
     return (

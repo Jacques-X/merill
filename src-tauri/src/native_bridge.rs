@@ -1,8 +1,9 @@
 use crate::{
     add_custom_publisher_core, fetch_article_body_core, force_recluster_core,
     generate_cluster_summary_core, get_clusters_core, get_publishers_core,
-    refresh_feed_core, remove_custom_publisher_core, split_cluster_core,
-    translate_summary_core, wipe_all_data_core, MerillCore,
+    get_refresh_status_core, get_saved_stories_core, refresh_feed_core,
+    remove_custom_publisher_core, save_story_core, search_stories_core, split_cluster_core,
+    translate_summary_core, unsave_story_core, wipe_all_data_core, MerillCore,
 };
 use serde::de::DeserializeOwned;
 use serde_json::{json, Value};
@@ -47,6 +48,38 @@ async fn dispatch(core: &MerillCore, request_json: &str) -> Result<Value, String
         }
         "refresh_feed" => serde_json::to_value(refresh_feed_core(core).await.map_err(failure)?)
             .map_err(|e| e.to_string()),
+        "get_refresh_status" => serde_json::to_value(get_refresh_status_core(core))
+            .map_err(|e| e.to_string()),
+        "get_saved_stories" => serde_json::to_value(get_saved_stories_core(core).map_err(failure)?)
+            .map_err(|e| e.to_string()),
+        "search_stories" => {
+            #[derive(serde::Deserialize)]
+            struct Input {
+                query: String,
+            }
+            let input: Input = decode(&payload)?;
+            serde_json::to_value(search_stories_core(core, input.query).map_err(failure)?)
+                .map_err(|e| e.to_string())
+        }
+        "save_story" => {
+            #[derive(serde::Deserialize)]
+            struct Input {
+                story_key: String,
+                article_ids: Vec<String>,
+            }
+            let input: Input = decode(&payload)?;
+            save_story_core(core, input.story_key, input.article_ids).map_err(failure)?;
+            Ok(Value::Null)
+        }
+        "unsave_story" => {
+            #[derive(serde::Deserialize)]
+            struct Input {
+                story_key: String,
+            }
+            let input: Input = decode(&payload)?;
+            unsave_story_core(core, input.story_key).map_err(failure)?;
+            Ok(Value::Null)
+        }
         "fetch_article_body" => {
             #[derive(serde::Deserialize)]
             struct Input {
@@ -224,6 +257,20 @@ mod tests {
 
         let clusters = dispatch(&core, r#"{"command":"get_clusters","payload":{"blindspots_only":false}}"#).await.unwrap();
         assert!(clusters.get("clusters").is_some_and(Value::is_array));
+
+        let saved = dispatch(&core, r#"{"command":"get_saved_stories","payload":{}}"#).await.unwrap();
+        assert!(saved.get("clusters").is_some_and(Value::is_array));
+
+        let search = dispatch(&core, r#"{"command":"search_stories","payload":{"query":"budget"}}"#).await.unwrap();
+        assert!(search.get("clusters").is_some_and(Value::is_array));
+
+        let status = dispatch(&core, r#"{"command":"get_refresh_status","payload":{}}"#).await.unwrap();
+        assert!(status.get("cooldown_remaining_seconds").is_some());
+
+        let save = dispatch(&core, r#"{"command":"save_story","payload":{"story_key":"story_test","article_ids":[]}}"#).await.unwrap();
+        assert!(save.is_null());
+        let unsave = dispatch(&core, r#"{"command":"unsave_story","payload":{"story_key":"story_test"}}"#).await.unwrap();
+        assert!(unsave.is_null());
     }
 
     #[tokio::test(flavor = "current_thread")]

@@ -37,6 +37,7 @@ targets:
     sources:
       - path: Sources/Native
       - path: Sources/AISummary.swift
+      - path: Sources/AIEmbedding.swift
       - path: Assets.xcassets
       - path: Externals
         excludes:
@@ -118,11 +119,24 @@ targets:
     settings:
       base:
         SWIFT_OBJC_BRIDGING_HEADER: Sources/app/bindings/bindings.h
-        OTHER_LDFLAGS: $(inherited) $(PROJECT_DIR)/../../target/debug/libapp_lib.a
+      configs:
+        debug:
+          OTHER_LDFLAGS: $(inherited) $(PROJECT_DIR)/../../target/debug/libapp_lib.a
+        release:
+          OTHER_LDFLAGS: $(inherited) $(PROJECT_DIR)/../../target/release/libapp_lib.a
       groups: [app]
+    dependencies:
+      - sdk: Carbon.framework
     preBuildScripts:
-      - script: cd ../.. && cargo build
+      - script: |
+          cd ../..
+          if [ "${CONFIGURATION}" = "release" ]; then
+            cargo build --release
+          else
+            cargo build
+          fi
         name: Build Rust Code
         basedOnDependencyAnalysis: false
         outputFiles:
           - $(SRCROOT)/../../target/debug/libapp_lib.a
+          - $(SRCROOT)/../../target/release/libapp_lib.a

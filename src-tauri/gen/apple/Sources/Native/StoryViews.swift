@@ -13,7 +13,7 @@ struct StoryGroupView: View {
             ScrollView {
                 VStack(alignment: .leading, spacing: 18) {
                     if let image = cluster.heroImageUrl {
-                        HeroImage(url: image, category: cluster.articles.first?.category)
+                        HeroImage(url: image)
                             .frame(width: contentWidth, height: min(220, contentWidth * 9 / 16))
                             .clipped()
                             .clipShape(RoundedRectangle(cornerRadius: 16, style: .continuous))
@@ -38,6 +38,26 @@ struct StoryGroupView: View {
                     }
                     BiasCoverageBar(articles: cluster.articles)
                         .frame(height: 6)
+                    if cluster.blindspotExplanation.missingIndependentCoverage {
+                        VStack(alignment: .leading, spacing: 5) {
+                            Label(
+                                L10n.text(language, "Why this is a blindspot", "Għaliex dan huwa punt mudlam"),
+                                systemImage: "eye.slash"
+                            )
+                            .font(.subheadline.weight(.semibold))
+                            Text(
+                                L10n.text(
+                                    language,
+                                    "\(cluster.blindspotExplanation.publisherCount) publishers cover this story, but no independent coverage was found.",
+                                    "\(cluster.blindspotExplanation.publisherCount) pubblikaturi jkopru din l-istorja, iżda ma nstabitx kopertura indipendenti."
+                                )
+                            )
+                            .font(.footnote)
+                            .foregroundStyle(.secondary)
+                        }
+                        .padding()
+                        .background(Color.orange.opacity(0.1), in: RoundedRectangle(cornerRadius: 14))
+                    }
                     Text(
                         L10n.count(
                             language,
@@ -47,9 +67,7 @@ struct StoryGroupView: View {
                         )
                     )
                         .font(.headline)
-                    PerspectiveCarousel(articles: cluster.articles)
-                        .frame(maxWidth: .infinity, alignment: .leading)
-                        .clipped()
+                    PerspectiveComparisonView(cluster: cluster)
                     DisclosureGroup(L10n.text(language, "Story timeline", "Kronoloġija tal-istorja"), isExpanded: $timelineOpen) {
                         TimelineView(articles: cluster.articles)
                             .padding(.top, 8)
@@ -109,6 +127,83 @@ struct PerspectiveCarousel: View {
                     }
                     .buttonStyle(.plain)
                 }
+            }
+        }
+    }
+}
+
+struct PerspectiveComparisonView: View {
+    @Environment(\.merillLanguage) private var language
+    let cluster: StoryCluster
+    @State private var advancedTermsOpen = false
+
+    var body: some View {
+        VStack(spacing: 12) {
+            Button {
+                withAnimation(.easeInOut(duration: 0.18)) {
+                    advancedTermsOpen.toggle()
+                }
+            } label: {
+                HStack {
+                    Text(L10n.text(language, "Advanced", "Avvanzat"))
+                    Spacer()
+                    Image(systemName: "chevron.down")
+                        .rotationEffect(.degrees(advancedTermsOpen ? 180 : 0))
+                }
+                .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .font(.caption.weight(.semibold))
+            .foregroundStyle(.secondary)
+
+            ForEach(cluster.perspectiveGroups) { group in
+                VStack(alignment: .leading, spacing: 10) {
+                    HStack {
+                        Circle().fill(group.biasCategory.color).frame(width: 9, height: 9)
+                        Text(group.biasCategory.title(language)).font(.headline)
+                        Spacer()
+                        Text(L10n.count(language, group.articles.count, english: "%d sources", maltese: "%d sorsi"))
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                    if advancedTermsOpen && !group.commonTerms.isEmpty {
+                        Text("\(L10n.text(language, "Shared terms", "Kliem komuni")): \(group.commonTerms.joined(separator: ", "))")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                    if advancedTermsOpen && !group.distinctTerms.isEmpty {
+                        Text("\(L10n.text(language, "Distinct terms", "Kliem distint")): \(group.distinctTerms.joined(separator: ", "))")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                    ForEach(group.articles) { item in
+                        if let article = cluster.articles.first(where: { $0.id == item.articleId }) {
+                            NavigationLink {
+                                ArticleReaderView(article: article)
+                            } label: {
+                                VStack(alignment: .leading, spacing: 4) {
+                                    HStack {
+                                        Text(item.publisherName).font(.caption.weight(.semibold))
+                                        Spacer()
+                                        Text(article.publishedDate, style: .relative)
+                                            .font(.caption2)
+                                            .foregroundStyle(.secondary)
+                                    }
+                                    TranslatedText(
+                                        original: article.originalHeadline,
+                                        sourceLanguage: article.language,
+                                        existingTranslation: article.translatedHeadline
+                                    )
+                                    .font(.subheadline)
+                                    .multilineTextAlignment(.leading)
+                                }
+                            }
+                            .buttonStyle(.plain)
+                        }
+                    }
+                }
+                .padding()
+                .background(Color.secondary.opacity(0.08), in: RoundedRectangle(cornerRadius: 14))
             }
         }
     }
@@ -175,6 +270,13 @@ struct TimelineView: View {
                         Text(article.publishedDate, style: .relative)
                             .font(.caption)
                             .foregroundStyle(.secondary)
+                        TranslatedText(
+                            original: article.originalHeadline,
+                            sourceLanguage: article.language,
+                            existingTranslation: article.translatedHeadline
+                        )
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
                     }
                 }
             }
@@ -278,7 +380,7 @@ struct ArticleReaderView: View {
             ScrollView {
                 VStack(alignment: .leading, spacing: 20) {
                     if !article.imageUrl.isEmpty {
-                        HeroImage(url: article.imageUrl, category: article.category)
+                        HeroImage(url: article.imageUrl)
                             .frame(width: contentWidth, height: min(220, contentWidth * 9 / 16))
                             .clipped()
                             .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
@@ -310,9 +412,11 @@ struct ArticleReaderView: View {
                             description: errorMessage
                         )
                     } else {
-                        Text(localizedBody.isEmpty ? (bodyText.isEmpty ? article.snippet : bodyText) : localizedBody)
+                        Text(model.readerTextMode == .original
+                            ? (bodyText.isEmpty ? article.snippet : bodyText)
+                            : (localizedBody.isEmpty ? (bodyText.isEmpty ? article.snippet : bodyText) : localizedBody))
                             .font(model.readerScale.font)
-                            .lineSpacing(5)
+                            .lineSpacing(model.readerLineSpacing.value)
                             .fixedSize(horizontal: false, vertical: true)
                             .frame(width: contentWidth, alignment: .leading)
                             .textSelection(.enabled)
@@ -342,6 +446,21 @@ struct ArticleReaderView: View {
                 }
                 .accessibilityLabel(L10n.text(language, "Increase text size", "Kabbar id-daqs tat-test"))
             }
+            ToolbarItem(placement: .primaryAction) {
+                Menu {
+                    Picker(L10n.text(language, "Text", "Test"), selection: $model.readerTextMode) {
+                        Text(L10n.text(language, "Translated", "Tradott")).tag(ReaderTextMode.translated)
+                        Text(L10n.text(language, "Original", "Oriġinali")).tag(ReaderTextMode.original)
+                    }
+                    Picker(L10n.text(language, "Line spacing", "Spazjar tal-linji"), selection: $model.readerLineSpacing) {
+                        Text(L10n.text(language, "Compact", "Kompatt")).tag(ReaderLineSpacing.compact)
+                        Text(L10n.text(language, "Comfortable", "Komdu")).tag(ReaderLineSpacing.comfortable)
+                        Text(L10n.text(language, "Relaxed", "Miftuħ")).tag(ReaderLineSpacing.relaxed)
+                    }
+                } label: {
+                    Image(systemName: "textformat")
+                }
+            }
             if #available(iOS 26.0, macOS 26.0, *) {
                 ToolbarSpacer(.fixed, placement: .primaryAction)
             }
@@ -363,14 +482,14 @@ struct ArticleReaderView: View {
             }
             loading = false
         }
-        .task(id: "\(language)|\(loading)|\(bodyText)") {
+        .task(id: "\(language)|\(loading)|\(bodyText)|\(model.readerTextMode.rawValue)") {
             guard !loading else { return }
             let source = bodyText.isEmpty ? article.snippet : bodyText
             guard !source.isEmpty else {
                 localizedBody = ""
                 return
             }
-            guard language != article.language else {
+            guard model.readerTextMode == .translated, language != article.language else {
                 localizedBody = source
                 return
             }

@@ -11,40 +11,18 @@ import { useAppStore } from "@/store/useAppStore";
 import type { StoryCluster } from "@/types";
 import { sessionBaseline } from "@/store/useAppStore";
 
-import type { LangKey } from "@/utils/i18n";
-
-// Typed mapping from category value to i18n key — avoids unsafe string concatenation.
-const CATEGORY_I18N_KEYS: Record<string, LangKey> = {
-  politics: "catPolitics", sport: "catSport", local: "catLocal",
-  international: "catInternational", crime: "catCrime", business: "catBusiness",
-  opinion: "catOpinion", entertainment: "catEntertainment", general: "catGeneral",
-};
-
-// Per-category accent colours for the image placeholder.
-const CATEGORY_COLORS: Record<string, string> = {
-  politics: "#3B82F6",
-  sport: "#10B981",
-  local: "#8B5CF6",
-  international: "#06B6D4",
-  crime: "#EF4444",
-  business: "#F59E0B",
-  opinion: "#EC4899",
-  entertainment: "#F97316",
-  general: "#6B7280",
-};
-
 interface StoryCardProps {
   cluster: StoryCluster;
   onPress?: (c: StoryCluster) => void;
   onDismiss?: (id: string) => void;
+  isSaved?: boolean;
+  onToggleSaved?: (cluster: StoryCluster) => void;
   animationDelay?: string;
 }
 
-export const StoryCard = memo(function StoryCard({ cluster, onPress, onDismiss, animationDelay = "0s" }: StoryCardProps) {
+export const StoryCard = memo(function StoryCard({ cluster, onPress, onDismiss, isSaved = false, onToggleSaved, animationDelay = "0s" }: StoryCardProps) {
   const lang = useAppStore(s => s.language);
   const biasOverrides = useAppStore(s => s.publisherBiasOverrides);
-  const isSaved = useAppStore(s => s.isClusterSaved(cluster.id));
-  const toggleSavedCluster = useAppStore(s => s.toggleSavedCluster);
   const articles = cluster.articles;
   const [imgError, setImgError] = useState(false);
   const [logoErrors, setLogoErrors] = useState<Set<string>>(new Set());
@@ -115,9 +93,6 @@ export const StoryCard = memo(function StoryCard({ cluster, onPress, onDismiss, 
     [cluster, lang],
   );
 
-  // Dominant category for the placeholder colour.
-  const dominantCategory = articles[0]?.category ?? "general";
-  const placeholderColor = CATEGORY_COLORS[dominantCategory] ?? CATEGORY_COLORS.general;
   const visibleHeadline = aiHeadline || fallbackHeadline;
 
   const stopCardAction = (e: React.MouseEvent) => e.stopPropagation();
@@ -129,7 +104,7 @@ export const StoryCard = memo(function StoryCard({ cluster, onPress, onDismiss, 
       aria-pressed={isSaved}
       onClick={(e) => {
         stopCardAction(e);
-        toggleSavedCluster(cluster.id);
+        onToggleSaved?.(cluster);
       }}
     >
       <Bookmark size={17} fill={isSaved ? "currentColor" : "none"} />
@@ -168,8 +143,7 @@ export const StoryCard = memo(function StoryCard({ cluster, onPress, onDismiss, 
         )}
       </div>
 
-      {/* Image or category colour placeholder */}
-      {imageUrl ? (
+      {imageUrl && (
         <div className="story-card-img">
           <img
             src={imageUrl}
@@ -178,15 +152,6 @@ export const StoryCard = memo(function StoryCard({ cluster, onPress, onDismiss, 
             loading="lazy"
             onError={() => setImgError(true)}
           />
-        </div>
-      ) : (
-        <div
-          className="story-card-img story-card-img-placeholder"
-          style={{ background: `linear-gradient(135deg, ${placeholderColor}33, ${placeholderColor}11)` }}
-        >
-          <span className="story-card-cat-label">
-            {t(lang, CATEGORY_I18N_KEYS[dominantCategory] ?? "catGeneral")}
-          </span>
         </div>
       )}
 
@@ -203,6 +168,13 @@ export const StoryCard = memo(function StoryCard({ cluster, onPress, onDismiss, 
           <p className="story-card-snippet">
             {snippet}{!aiSummary && "…"}
             <span className="story-card-seemore">{t(lang, "seeMore")}</span>
+          </p>
+        )}
+
+        {cluster.blindspot_explanation.missing_independent_coverage && (
+          <p className="story-blindspot-note">
+            <EyeOff size={13} />
+            {cluster.blindspot_explanation.publisher_count} {cluster.blindspot_explanation.publisher_count === 1 ? t(lang, "source") : t(lang, "sources")} · {t(lang, "noIndependentCoverage")}
           </p>
         )}
 

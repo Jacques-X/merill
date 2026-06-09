@@ -3,6 +3,8 @@ import { persist, createJSONStorage } from "zustand/middleware";
 import type { AppSettings, BiasCategory } from "@/types";
 
 export type ReaderFontSize = "sm" | "md" | "lg";
+export type ReaderLineSpacing = "compact" | "comfortable" | "relaxed";
+export type ReaderTextMode = "translated" | "original";
 
 interface AppState extends AppSettings {
   setTheme: (t: AppSettings["theme"]) => void;
@@ -13,14 +15,23 @@ interface AppState extends AppSettings {
   isLocalPublisherEnabled: (id: string) => boolean;
   isGlobalPublisherEnabled: (id: string) => boolean;
   setPublisherBias: (id: string, category: BiasCategory) => void;
-  toggleSavedCluster: (id: string) => void;
-  isClusterSaved: (id: string) => boolean;
+  setStorySaved: (storyKey: string, saved: boolean) => void;
+  replaceSavedStoryKeys: (storyKeys: string[]) => void;
+  isStorySaved: (storyKey: string) => boolean;
+  legacySavedClusterIds: string[];
+  clearLegacySavedClusterIds: () => void;
   // Last time the user opened the app — used to mark "New" stories.
   lastOpenedAt: string;
   touchLastOpened: () => void;
   // Font size preference for the article reader.
   readerFontSize: ReaderFontSize;
   setReaderFontSize: (size: ReaderFontSize) => void;
+  readerLineSpacing: ReaderLineSpacing;
+  setReaderLineSpacing: (spacing: ReaderLineSpacing) => void;
+  readerTextMode: ReaderTextMode;
+  setReaderTextMode: (mode: ReaderTextMode) => void;
+  onboardingComplete: boolean;
+  setOnboardingComplete: (complete: boolean) => void;
 }
 
 // Mutable ref holding the previous session's timestamp.
@@ -32,12 +43,16 @@ export const useAppStore = create<AppState>()(persist((set, get) => ({
   theme: "system",
   language: "en",
   feedScope: "local",
-  savedClusterIds: [],
+  savedStoryKeys: [],
+  legacySavedClusterIds: [],
   localDisabledPublisherIds: [],
   globalDisabledPublisherIds: [],
   publisherBiasOverrides: {} as Record<string, BiasCategory>,
   lastOpenedAt: new Date(0).toISOString(), // epoch → all stories appear New on first run
   readerFontSize: "md",
+  readerLineSpacing: "comfortable",
+  readerTextMode: "translated",
+  onboardingComplete: false,
 
   setTheme: (theme) => set({ theme }),
   setLanguage: (language) => set({ language }),
@@ -66,19 +81,21 @@ export const useAppStore = create<AppState>()(persist((set, get) => ({
   setPublisherBias: (id, category) => set(s => ({
     publisherBiasOverrides: { ...s.publisherBiasOverrides, [id]: category },
   })),
-  toggleSavedCluster: (id) => {
-    const saved = new Set(get().savedClusterIds);
-    if (saved.has(id)) {
-      saved.delete(id);
-    } else {
-      saved.add(id);
-    }
-    set({ savedClusterIds: [...saved] });
+  setStorySaved: (storyKey, isSaved) => {
+    const saved = new Set(get().savedStoryKeys);
+    if (isSaved) saved.add(storyKey);
+    else saved.delete(storyKey);
+    set({ savedStoryKeys: [...saved] });
   },
-  isClusterSaved: (id) => get().savedClusterIds.includes(id),
+  replaceSavedStoryKeys: (savedStoryKeys) => set({ savedStoryKeys }),
+  isStorySaved: (storyKey) => get().savedStoryKeys.includes(storyKey),
+  clearLegacySavedClusterIds: () => set({ legacySavedClusterIds: [] }),
 
   touchLastOpened: () => set({ lastOpenedAt: new Date().toISOString() }),
   setReaderFontSize: (readerFontSize) => set({ readerFontSize }),
+  setReaderLineSpacing: (readerLineSpacing) => set({ readerLineSpacing }),
+  setReaderTextMode: (readerTextMode) => set({ readerTextMode }),
+  setOnboardingComplete: (onboardingComplete) => set({ onboardingComplete }),
 }), {
   name: "malta-news-settings",
   storage: createJSONStorage(() => localStorage),
@@ -86,11 +103,28 @@ export const useAppStore = create<AppState>()(persist((set, get) => ({
     theme: s.theme,
     language: s.language,
     feedScope: s.feedScope,
-    savedClusterIds: s.savedClusterIds,
+    savedStoryKeys: s.savedStoryKeys,
+    legacySavedClusterIds: s.legacySavedClusterIds,
     localDisabledPublisherIds: s.localDisabledPublisherIds,
     globalDisabledPublisherIds: s.globalDisabledPublisherIds,
     publisherBiasOverrides: s.publisherBiasOverrides,
     lastOpenedAt: s.lastOpenedAt,
     readerFontSize: s.readerFontSize,
+    readerLineSpacing: s.readerLineSpacing,
+    readerTextMode: s.readerTextMode,
+    onboardingComplete: s.onboardingComplete,
   }),
+  version: 2,
+  migrate: (persisted, version) => {
+    const state = persisted as Record<string, unknown>;
+    if (version < 2) {
+      state.savedStoryKeys = [];
+      state.legacySavedClusterIds = Array.isArray(state.savedClusterIds)
+        ? state.savedClusterIds
+        : [];
+      delete state.savedClusterIds;
+      state.onboardingComplete = false;
+    }
+    return state as unknown as AppState;
+  },
 }));

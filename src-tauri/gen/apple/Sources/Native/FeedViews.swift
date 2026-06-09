@@ -22,6 +22,35 @@ struct FeedView: View {
                 }
             }
             .navigationTitle(tab.title(language))
+            .searchable(text: $model.searchText, prompt: L10n.text(language, "Search stories", "Fittex stejjer"))
+            .onChange(of: model.searchText) { _ in
+                Task { await model.search() }
+            }
+            .toolbar {
+                ToolbarItem(placement: .primaryAction) {
+                    Menu {
+                        sortButton(.balanced, "For You", "Għalik")
+                        sortButton(.latest, "Latest", "L-Aħħar")
+                        sortButton(.covered, "Most covered", "L-aktar koperti")
+                        sortButton(.blindspots, "Blindspots", "Punti mudlama")
+                    } label: {
+                        Image(systemName: "arrow.up.arrow.down")
+                    }
+                }
+            }
+        }
+    }
+
+    @ViewBuilder
+    private func sortButton(_ sort: FeedSort, _ english: String, _ maltese: String) -> some View {
+        Button {
+            model.feedSort = sort
+        } label: {
+            if model.feedSort == sort {
+                Label(L10n.text(language, english, maltese), systemImage: "checkmark")
+            } else {
+                Text(L10n.text(language, english, maltese))
+            }
         }
     }
 
@@ -33,17 +62,33 @@ struct FeedView: View {
         ScrollView {
             LazyVStack(alignment: .leading, spacing: 18) {
                 if !model.failedSources.isEmpty {
-                    Label(
-                        L10n.count(
-                            language,
-                            model.failedSources.count,
-                            english: "%d sources could not refresh",
-                            maltese: "%d sorsi ma setgħux jiġu aġġornati"
-                        ),
-                        systemImage: "exclamationmark.triangle.fill"
-                    )
+                    DisclosureGroup {
+                        ForEach(model.failedSources, id: \.self) { source in
+                            Text(source).font(.caption)
+                        }
+                        Button(L10n.text(language, "Retry sources", "Erġa' pprova s-sorsi")) {
+                            Task { try? await model.refresh() }
+                        }
+                        .font(.footnote.weight(.semibold))
+                    } label: {
+                        Label(
+                            L10n.count(
+                                language,
+                                model.failedSources.count,
+                                english: "%d sources could not refresh",
+                                maltese: "%d sorsi ma setgħux jiġu aġġornati"
+                            ),
+                            systemImage: "exclamationmark.triangle.fill"
+                        )
                         .font(.footnote.weight(.medium))
                         .foregroundStyle(.orange)
+                    }
+                    .padding(.horizontal)
+                }
+                if let last = model.lastRefreshAt {
+                    Text("\(L10n.text(language, "Updated", "Aġġornat")) \(last, style: .relative)")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
                         .padding(.horizontal)
                 }
                 ScopePicker(scope: $model.scope)
@@ -178,9 +223,9 @@ struct EditorialStoryCard: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
-            HeroImage(url: cluster.heroImageUrl, category: cluster.articles.first?.category)
-                .frame(height: 210)
-                .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
+            if let imageUrl = cluster.heroImageUrl {
+                HeroImage(url: imageUrl)
+            }
             TranslatedText(
                 original: cluster.headline(language: "en"),
                 sourceLanguage: "en",
@@ -200,6 +245,14 @@ struct EditorialStoryCard: View {
                     .multilineTextAlignment(.leading)
             }
             BiasCoverageBar(articles: cluster.articles)
+            if cluster.blindspotExplanation.missingIndependentCoverage {
+                Label(
+                    L10n.text(language, "No independent coverage found", "Ma nstabitx kopertura indipendenti"),
+                    systemImage: "eye.slash"
+                )
+                .font(.caption.weight(.semibold))
+                .foregroundStyle(.orange)
+            }
             HStack {
                 PublisherAvatars(articles: cluster.articles)
                 Spacer()
@@ -218,27 +271,27 @@ struct EditorialStoryCard: View {
 
 struct HeroImage: View {
     let url: String?
-    let category: String?
 
     var body: some View {
         if let url, let parsed = URL(string: url) {
             AsyncImage(url: parsed) { phase in
                 switch phase {
-                case .success(let image): image.resizable().scaledToFill()
-                default: placeholder
+                case .success(let image):
+                    image
+                        .resizable()
+                        .scaledToFill()
+                        .frame(height: 210)
+                        .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
+                case .empty:
+                    ProgressView()
+                        .frame(maxWidth: .infinity)
+                        .frame(height: 210)
+                case .failure:
+                    EmptyView()
+                @unknown default:
+                    EmptyView()
                 }
             }
-        } else {
-            placeholder
-        }
-    }
-
-    private var placeholder: some View {
-        ZStack {
-            Color.secondary.opacity(0.12)
-            Image(systemName: "newspaper")
-                .font(.largeTitle)
-                .foregroundStyle(.secondary)
         }
     }
 }
