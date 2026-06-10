@@ -33,9 +33,9 @@ export const BIAS_META: BiasMeta[] = [
   { key:"church_owned",              labelKey:"biasChurch",        shortLabelKey:"biasChurchShort",        color:"var(--bias-church)",        hex:"#F59E0B" },
   { key:"commercial_independent",    labelKey:"biasIndependent",   shortLabelKey:"biasIndependentShort",   color:"var(--bias-commercial)",    hex:"#10B981" },
   { key:"investigative_independent", labelKey:"biasInvestigative", shortLabelKey:"biasInvestigativeShort", color:"var(--bias-investigative)", hex:"#06B6D4" },
-  { key:"left",                      labelKey:"biasLeft",          shortLabelKey:"biasLeftShort",          color:"#EF4444",                   hex:"#EF4444" },
-  { key:"centre",                    labelKey:"biasCentre",        shortLabelKey:"biasCentreShort",        color:"#8E8E93",                   hex:"#8E8E93" },
-  { key:"right",                     labelKey:"biasRight",         shortLabelKey:"biasRightShort",         color:"#3B82F6",                   hex:"#3B82F6" },
+  { key:"left",                      labelKey:"biasLeft",          shortLabelKey:"biasLeftShort",          color:"var(--bias-left)",          hex:"#EF4444" },
+  { key:"centre",                    labelKey:"biasCentre",        shortLabelKey:"biasCentreShort",        color:"var(--bias-centre)",        hex:"#8E8E93" },
+  { key:"right",                     labelKey:"biasRight",         shortLabelKey:"biasRightShort",         color:"var(--bias-right)",         hex:"#3B82F6" },
 ];
 
 export function getActiveBiasSegments(coverage: BiasCoverage) {

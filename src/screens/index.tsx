@@ -9,7 +9,7 @@ import { BiasBar } from "@/components/BiasBar/BiasBar";
 import { computeBiasCoverage } from "@/utils/bias";
 import { BIAS_COLORS, LOCAL_BIAS_OPTIONS, GLOBAL_BIAS_OPTIONS } from "@/utils/constants";
 import { articleHeadline, clusterHeadline } from "@/utils/headline";
-import { t } from "@/utils/i18n";
+import { t, format } from "@/utils/i18n";
 import { useAppStore } from "@/store/useAppStore";
 import type { StoryCluster, Category, BiasCategory, Article } from "@/types";
 
@@ -148,8 +148,8 @@ function combineSummary(bodyTexts: string[]): string {
   }
 
   const allSentences: string[] = [];
-  for (const t of texts) {
-    const chunk = t.split("\n\n").slice(0, 2).join(" ");
+  for (const text of texts) {
+    const chunk = text.split("\n\n").slice(0, 2).join(" ");
     // Split on sentence boundaries only when followed by whitespace + capital letter,
     // avoiding false splits on abbreviations like "Dr.", "U.S.", initials, etc.
     const sentences = chunk.split(/(?<=[.!?])\s+(?=[A-Z])/).map(s => s.trim()).filter(Boolean);
@@ -457,9 +457,9 @@ export function StoryDetailScreen({
             <div className="source-avatar lg" style={{
               backgroundColor: BIAS_COLORS[biasOverrides[a.publisher_id] ?? a.publisher.bias_category] ?? "#8E8E93",
             }}>
-              {a.publisher.logo_url && !logoErrors.has(a.id) ? (
+              {a.publisher.logo_url && !logoErrors.has(a.publisher_id) ? (
                 <img src={a.publisher.logo_url} alt={a.publisher.name}
-                  onError={() => setLogoErrors(s => new Set(s).add(a.id))} />
+                  onError={() => setLogoErrors(s => new Set(s).add(a.publisher_id))} />
               ) : (
                 <span>{a.publisher.name.slice(0, 2).toUpperCase()}</span>
               )}
@@ -525,7 +525,7 @@ export function StoryDetailScreen({
           </a>
 
           <button onClick={() => setSelectedArticle(null)} className="back-to-sources">
-            {t(lang, "viewAllSources").replace("{n}", String(cluster.articles.length))}
+            {format(t(lang, "viewAllSources"), { n: String(cluster.articles.length) })}
           </button>
         </div>
       </div>
@@ -580,9 +580,10 @@ export function StoryDetailScreen({
           <div className="blindspot-explanation">
             <strong>{t(lang, "whyBlindspot")}</strong>
             <p>
-              {t(lang, "blindspotReason")
-                .replace("{count}", String(cluster.blindspot_explanation.publisher_count))
-                .replace("{categories}", cluster.blindspot_explanation.covered_categories.map(category => t(lang, BIAS_I18N[category])).join(", "))}
+              {format(t(lang, "blindspotReason"), {
+                n: String(cluster.blindspot_explanation.publisher_count),
+                categories: cluster.blindspot_explanation.covered_categories.map(category => t(lang, BIAS_I18N[category])).join(", "),
+              })}
             </p>
           </div>
         )}
@@ -746,6 +747,7 @@ export function FeedScreen({
   const globalDisabledPublisherIds = useAppStore(s => s.globalDisabledPublisherIds);
   const biasOverrides = useAppStore(s => s.publisherBiasOverrides);
   const savedStoryKeys = useAppStore(s => s.savedStoryKeys);
+  const savedStoryKeySet = useMemo(() => new Set(savedStoryKeys), [savedStoryKeys]);
   const setStorySaved = useAppStore(s => s.setStorySaved);
   const replaceSavedStoryKeys = useAppStore(s => s.replaceSavedStoryKeys);
   const legacySavedClusterIds = useAppStore(s => s.legacySavedClusterIds);
@@ -822,7 +824,7 @@ export function FeedScreen({
     if (rootView === "blindspots") {
       arr = arr.filter(c => c.is_blindspot);
     } else if (rootView === "saved") {
-      arr = arr.filter(c => savedStoryKeys.includes(c.story_key));
+      arr = arr.filter(c => savedStoryKeySet.has(c.story_key));
     }
 
     // Apply category filter.
@@ -841,7 +843,7 @@ export function FeedScreen({
         const publisherCount = new Set(cluster.articles.map(a => a.publisher_id)).size;
         const freshnessHours = Math.max(0, (Date.now() - new Date(cluster.last_updated).getTime()) / 3_600_000);
         const freshness = 1 - Math.min(freshnessHours, 72) / 72;
-        const independentCoverage = cluster.blindspot_explanation.missing_independent_coverage ? 0 : 1;
+        const independentCoverage = cluster.is_blindspot ? 0 : 1;
         return freshness * 0.45 + Math.min(publisherCount, 4) / 4 * 0.35 + independentCoverage * 0.15 + Number(cluster.is_blindspot) * 0.05;
       };
       arr.sort((a, b) => score(b) - score(a) || b.last_updated.localeCompare(a.last_updated));
@@ -908,7 +910,7 @@ export function FeedScreen({
   }, [queryClient, refetch, refetchSaved]);
 
   const toggleSaved = useCallback(async (cluster: StoryCluster) => {
-    const currentlySaved = savedStoryKeys.includes(cluster.story_key);
+    const currentlySaved = savedStoryKeySet.has(cluster.story_key);
     setStorySaved(cluster.story_key, !currentlySaved);
     try {
       if (currentlySaved) {
@@ -1050,7 +1052,7 @@ export function FeedScreen({
           <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round">
             <circle cx="12" cy="12" r="10" /><path d="M12 8v4M12 16h.01" />
           </svg>
-          {t(lang, "sourcesFailed").replace("{n}", String(failedSources.length))}
+          {format(t(lang, "sourcesFailed"), { n: String(failedSources.length) })}
           <button className="banner-dismiss" onClick={() => setFailedSources([])}>×</button>
         </div>
       )}
@@ -1150,7 +1152,7 @@ export function FeedScreen({
             <StoryCard
               cluster={c}
               onPress={onSelectCluster}
-              isSaved={savedStoryKeys.includes(c.story_key)}
+              isSaved={savedStoryKeySet.has(c.story_key)}
               onToggleSaved={toggleSaved}
               onDismiss={(id) => setDismissedIds(s => new Set(s).add(id))}
               animationDelay={`${Math.min(i * 0.05, 0.3)}s`}
@@ -1350,7 +1352,7 @@ export function SettingsScreen() {
   const [wipeConfirm, setWipeConfirm] = useState(false);
   const [settingsError, setSettingsError] = useState<string | null>(null);
   const [settingsSuccess, setSettingsSuccess] = useState<string | null>(null);
-  const [openSection, setOpenSection] = useState<"appearance" | "sources" | "advanced" | "about">("appearance");
+  const [openSection, setOpenSection] = useState<"appearance" | "sources" | "advanced" | "about" | null>("appearance");
   const [showLocalForm, setShowLocalForm] = useState(false);
   const [showGlobalForm, setShowGlobalForm] = useState(false);
   const { data: publishers = [] } = usePublishers();
@@ -1395,7 +1397,7 @@ export function SettingsScreen() {
     light: t(language, "light"),
     dark: t(language, "dark"),
   };
-  const toggleSection = (section: typeof openSection) => setOpenSection(current => current === section ? "about" : section);
+  const toggleSection = (section: NonNullable<typeof openSection>) => setOpenSection(current => current === section ? null : section);
   const notifySourceAdded = async () => {
     await invalidatePublisherData();
     setSettingsSuccess(t(language, "sourceAdded"));

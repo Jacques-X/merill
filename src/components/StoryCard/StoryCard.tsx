@@ -7,9 +7,8 @@ import { computeBiasCoverage } from "@/utils/bias";
 import { BIAS_COLORS } from "@/utils/constants";
 import { clusterHeadline } from "@/utils/headline";
 import { t } from "@/utils/i18n";
-import { useAppStore } from "@/store/useAppStore";
+import { useAppStore, sessionBaseline } from "@/store/useAppStore";
 import type { StoryCluster } from "@/types";
-import { sessionBaseline } from "@/store/useAppStore";
 
 interface StoryCardProps {
   cluster: StoryCluster;

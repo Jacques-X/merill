@@ -88,7 +88,7 @@ export const useAppStore = create<AppState>()(persist((set, get) => ({
     set({ savedStoryKeys: [...saved] });
   },
   replaceSavedStoryKeys: (savedStoryKeys) => set({ savedStoryKeys }),
-  isStorySaved: (storyKey) => get().savedStoryKeys.includes(storyKey),
+  isStorySaved: (storyKey) => new Set(get().savedStoryKeys).has(storyKey),
   clearLegacySavedClusterIds: () => set({ legacySavedClusterIds: [] }),
 
   touchLastOpened: () => set({ lastOpenedAt: new Date().toISOString() }),
@@ -123,7 +123,11 @@ export const useAppStore = create<AppState>()(persist((set, get) => ({
         ? state.savedClusterIds
         : [];
       delete state.savedClusterIds;
-      state.onboardingComplete = false;
+      // Treat users with prior activity as having already completed onboarding —
+      // only brand-new installs (no saved clusters) should see it.
+      state.onboardingComplete = Array.isArray(state.legacySavedClusterIds)
+        ? (state.legacySavedClusterIds as unknown[]).length > 0
+        : false;
     }
     return state as unknown as AppState;
   },

@@ -1,4 +1,4 @@
-import { useQuery } from "@tanstack/react-query";
+import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
 import { invoke } from "@tauri-apps/api/core";
 import type { ClustersResponse, RefreshResult, RefreshStatus, Publisher } from "@/types";
 
@@ -78,9 +78,11 @@ export async function wipeAllData(): Promise<void> {
 }
 
 export function useRefreshFeed() {
-  return useQuery({
-    queryKey: ["refresh"],
-    queryFn: refreshFeed,
-    enabled: false,
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: refreshFeed,
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: clusterKeys.all() });
+    },
   });
 }

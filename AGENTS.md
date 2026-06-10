@@ -177,11 +177,12 @@ src-tauri/
 
 **Adding a Translation Key**
 1. Add key-value pair to `src/utils/i18n.ts` under both "en" and "mt" objects
-2. Use `t(lang, "keyName")` in components
+2. Use `t(lang, "keyName")` in components; for strings with `{n}` placeholders use `format(t(lang, "key"), { n: value })`
 3. No rebuild needed; hot reload picks it up
 
 **Adjusting Publisher Bias Colors**
-- Edit `BIAS_COLORS` in `src/utils/constants.ts`
+- Edit the `hex` field in the relevant `BIAS_META` entry in `src/utils/bias.ts`
+- `BIAS_COLORS` in `src/utils/constants.ts` is derived from `BIAS_META` — do not edit it directly
 - Rebuild CSS if needed; TailwindCSS will pick up new palette
 
 **Customizing Story Clustering**

@@ -160,7 +160,7 @@ const strings = {
     labourSays: "PL",
     nationalistSays: "PN",
     whyBlindspot: "Why this is a blindspot",
-    blindspotReason: "{count} publisher(s) cover this story across {categories}, with no independent coverage found.",
+    blindspotReason: "{n} publisher(s) cover this story across {categories}, with no independent coverage found.",
     noIndependentCoverage: "No independent coverage found",
     sharedTerms: "Shared terms",
     distinctTerms: "Distinct terms",
@@ -351,7 +351,7 @@ const strings = {
     labourSays: "PL",
     nationalistSays: "PN",
     whyBlindspot: "Għaliex dan huwa punt mudlam",
-    blindspotReason: "{count} pubblikatur(i) qed ikopru din l-istorja f'{categories}, mingħajr kopertura indipendenti.",
+    blindspotReason: "{n} pubblikatur(i) qed ikopru din l-istorja f'{categories}, mingħajr kopertura indipendenti.",
     noIndependentCoverage: "Ma nstabitx kopertura indipendenti",
     sharedTerms: "Kliem komuni",
     distinctTerms: "Kliem distint",
@@ -401,4 +401,11 @@ export type LangKey = keyof typeof strings.en;
 
 export function t(lang: "en" | "mt", key: LangKey): string {
   return strings[lang][key] ?? strings.en[key];
+}
+
+/** Interpolate named `{placeholder}` tokens in a translated string.
+ *  @example format(t(lang, "sourcesFailed"), { n: "3" }) → "3 source(s) unavailable"
+ */
+export function format(str: string, vars: Record<string, string>): string {
+  return str.replace(/\{(\w+)\}/g, (_, k) => vars[k] ?? `{${k}}`);
 }
