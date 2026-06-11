@@ -1,6 +1,8 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::OnceLock;
 
+use chrono::DateTime;
+
 use crate::models::BiasCategory;
 use crate::publishers::PUBLISHERS;
 
@@ -309,7 +311,7 @@ const STOP_WORDS: &[&str] = &[
     "mal",
     "bħal", // preposition combos
     "dan",
-    "din",
+    // "din" intentionally omitted — it appears in "Din l-Art Ħelwa" (a distinct NGO entity)
     "dawn",
     "dak",
     "dik",
@@ -672,21 +674,32 @@ fn tfidf_cosine(a: &[Token], b: &[Token], idf: &HashMap<String, f32>) -> (f32, b
 
 // ── Time helper ─────────────────────────────────────────────────────────────
 
-fn hours_between(a: &str, b: &str) -> f64 {
-    fn to_hours(s: &str) -> Option<f64> {
-        let bytes = s.as_bytes();
-        if bytes.len() < 13 {
-            return None;
-        }
-        let year: f64 = std::str::from_utf8(&bytes[0..4]).ok()?.parse().ok()?;
-        let month: f64 = std::str::from_utf8(&bytes[5..7]).ok()?.parse().ok()?;
-        let day: f64 = std::str::from_utf8(&bytes[8..10]).ok()?.parse().ok()?;
-        let hour: f64 = std::str::from_utf8(&bytes[11..13]).ok()?.parse().ok()?;
-        Some(year * 8766.0 + month * 730.5 + day * 24.0 + hour)
+/// Parse an ISO 8601 / RFC 3339 timestamp and return seconds since epoch.
+/// Returns None on parse failure; callers treat None as "very far apart".
+fn parse_timestamp(s: &str) -> Option<i64> {
+    // Try RFC 3339 / ISO 8601 first ("2026-05-01T12:00:00+02:00")
+    if let Ok(d) = DateTime::parse_from_rfc3339(s) {
+        return Some(d.timestamp());
     }
-    let ha = to_hours(a).unwrap_or(0.0);
-    let hb = to_hours(b).unwrap_or(0.0);
-    (ha - hb).abs()
+    // Naive datetime without timezone ("2026-05-01T12:00:00")
+    if let Ok(d) = chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%dT%H:%M:%S") {
+        return Some(d.and_utc().timestamp());
+    }
+    // Truncated to minute ("2026-05-01T12:00")
+    if s.len() >= 16 {
+        if let Ok(d) = chrono::NaiveDateTime::parse_from_str(&s[..16], "%Y-%m-%dT%H:%M") {
+            return Some(d.and_utc().timestamp());
+        }
+    }
+    None
+}
+
+fn hours_between(a: &str, b: &str) -> f64 {
+    match (parse_timestamp(a), parse_timestamp(b)) {
+        (Some(ta), Some(tb)) => (ta - tb).unsigned_abs() as f64 / 3600.0,
+        // If either timestamp fails to parse, treat as stale to avoid false matches.
+        _ => STALE_HOURS * 100.0,
+    }
 }
 
 // ── Cluster assignment ───────────────────────────────────────────────────────
@@ -1161,26 +1174,64 @@ fn source_score(publisher_id: &str) -> u8 {
 }
 
 /// Pick the most representative headline for a cluster.
+///
+/// Strategy: among articles from the highest-quality source tier, pick the
+/// most *central* headline — the one whose non-trivial words have the most
+/// overlap with the rest of the cluster. This avoids choosing an unusually
+/// long clickbait headline simply because it is the longest.
+///
 /// Input: (original_headline, translated_headline, language, publisher_id, snippet, category)
 pub fn pick_best_headline(articles: &[(String, String, String, String, String, String)]) -> String {
     if articles.is_empty() {
         return String::new();
     }
+
+    // Resolve each article to its best English headline text.
+    let en_headlines: Vec<&str> = articles
+        .iter()
+        .map(|(h, t, lang, _, _, _)| {
+            if lang == "en" {
+                h.as_str()
+            } else if !t.is_empty() {
+                t.as_str()
+            } else {
+                h.as_str()
+            }
+        })
+        .collect();
+
+    // Find the best source tier available in this cluster.
+    let max_score = articles
+        .iter()
+        .map(|(_, _, _, pub_id, _, _)| source_score(pub_id))
+        .max()
+        .unwrap_or(0);
+
+    // Among top-tier sources, pick the medoid: the headline whose substantive
+    // words (len > 3) have the highest total overlap with every other headline
+    // in the cluster.
     articles
         .iter()
-        .map(|(headline, translated, lang, pub_id, _snippet, _cat)| {
-            let en_headline = if lang == "en" {
-                headline.as_str()
-            } else if !translated.is_empty() {
-                translated.as_str()
-            } else {
-                headline.as_str()
-            };
-            let score = source_score(pub_id);
-            (en_headline, score, en_headline.len())
+        .enumerate()
+        .filter(|(_, (_, _, _, pub_id, _, _))| source_score(pub_id) == max_score)
+        .max_by_key(|(i, _)| {
+            let words: HashSet<&str> = en_headlines[*i]
+                .split_whitespace()
+                .filter(|w| w.len() > 3)
+                .collect();
+            en_headlines
+                .iter()
+                .enumerate()
+                .filter(|(j, _)| *j != *i)
+                .map(|(_, other)| {
+                    other
+                        .split_whitespace()
+                        .filter(|w| words.contains(w))
+                        .count()
+                })
+                .sum::<usize>()
         })
-        .max_by_key(|(_, score, len)| (*score, *len))
-        .map(|(h, _, _)| h.to_string())
+        .map(|(i, _)| en_headlines[i].to_string())
         .unwrap_or_else(|| articles[0].0.clone())
 }
 

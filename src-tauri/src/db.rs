@@ -1,5 +1,5 @@
 use anyhow::Result;
-use rusqlite::{params, Connection};
+use rusqlite::{params, Connection, OptionalExtension};
 use std::collections::HashMap;
 
 use crate::models::{CustomPublisherDef, RawArticle};
@@ -88,6 +88,16 @@ pub fn open(path: &std::path::Path) -> Result<Connection> {
 
         CREATE INDEX IF NOT EXISTS idx_clustering_diagnostics_decision
             ON clustering_diagnostics(decision, score DESC);
+
+        -- Cannot-link constraints set by user splits.
+        -- When a user manually splits article A out of cluster C, we record
+        -- (article_id=A, old_cluster_id=C) so the next recluster never re-merges them.
+        CREATE TABLE IF NOT EXISTS user_cluster_splits (
+            article_id      TEXT NOT NULL,
+            old_cluster_id  TEXT NOT NULL,
+            created_at      TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            PRIMARY KEY (article_id, old_cluster_id)
+        );
         ",
     )?;
 
@@ -553,6 +563,61 @@ pub fn load_cluster_publishers(
 }
 
 
+/// Record that the user manually split `article_id` out of `old_cluster_id`.
+/// This pair becomes a cannot-link constraint: recluster will never re-merge them.
+pub fn record_user_split(
+    conn: &Connection,
+    article_id: &str,
+    old_cluster_id: &str,
+) -> Result<()> {
+    conn.execute(
+        "INSERT OR IGNORE INTO user_cluster_splits (article_id, old_cluster_id)
+         VALUES (?1, ?2)",
+        params![article_id, old_cluster_id],
+    )?;
+    Ok(())
+}
+
+/// Undo a user-initiated split: moves the article back to its previous cluster and removes
+/// the cannot-link constraint so the semantic clusterer can merge them again.
+/// Returns Ok(()) if no record exists (idempotent).
+pub fn revert_user_split(conn: &Connection, article_id: &str) -> Result<()> {
+    // Look up the original cluster.
+    let old_id: Option<String> = conn
+        .query_row(
+            "SELECT old_cluster_id FROM user_cluster_splits WHERE article_id = ?1",
+            params![article_id],
+            |row| row.get(0),
+        )
+        .optional()?;
+
+    if let Some(old_cluster_id) = old_id {
+        // Move the article back to the original cluster.
+        conn.execute(
+            "UPDATE articles SET cluster_id = ?1 WHERE id = ?2",
+            params![old_cluster_id, article_id],
+        )?;
+        // Remove the cannot-link constraint.
+        conn.execute(
+            "DELETE FROM user_cluster_splits WHERE article_id = ?1",
+            params![article_id],
+        )?;
+    }
+    Ok(())
+}
+
+/// Return all cannot-link pairs from user-initiated splits as (article_id, old_cluster_id).
+/// Used by semantic reclustering to avoid re-merging articles the user deliberately separated.
+pub fn load_cannot_link_pairs(conn: &Connection) -> Result<Vec<(String, String)>> {
+    let mut stmt = conn.prepare(
+        "SELECT article_id, old_cluster_id FROM user_cluster_splits",
+    )?;
+    let rows = stmt.query_map([], |row| {
+        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+    })?;
+    rows.collect::<rusqlite::Result<Vec<_>>>().map_err(Into::into)
+}
+
 /// Move a single article to a new cluster (user-initiated split).
 /// Creates the new cluster row and deletes any old cluster that becomes empty.
 pub fn split_article_to_cluster(
@@ -562,6 +627,17 @@ pub fn split_article_to_cluster(
     headline: &str,
     published_at: &str,
 ) -> Result<()> {
+    // Capture the article's current cluster *before* moving it, so we can record
+    // the cannot-link constraint.
+    let old_cluster_id: Option<String> = conn
+        .query_row(
+            "SELECT cluster_id FROM articles WHERE id = ?1",
+            params![article_id],
+            |row| row.get(0),
+        )
+        .ok()
+        .flatten();
+
     conn.execute(
         "UPDATE articles SET cluster_id = ?1 WHERE id = ?2",
         params![new_cluster_id, article_id],
@@ -578,6 +654,11 @@ pub fn split_article_to_cluster(
          )",
         [],
     )?;
+    // Record the cannot-link constraint so recluster won't re-merge this article
+    // back into its old cluster.
+    if let Some(ref old_id) = old_cluster_id {
+        record_user_split(conn, article_id, old_id)?;
+    }
     Ok(())
 }
 

@@ -177,6 +177,17 @@ const strings = {
     // Publisher article count (Settings)
     articlesToday: "articles",
 
+    // AI-generated content label
+    aiSummaryLabel: "AI summary",
+
+    // Split confirmation + undo
+    splitSuccess: "Removed from group",
+    undoAction: "Undo",
+    storyHidden: "Story hidden",
+
+    // Bias bar legend (compact tap target)
+    showBiasLegend: "Show coverage breakdown",
+
     // Cluster management
     groupingConfidence: "Grouping",
     groupingSingle: "Single source",
@@ -363,6 +374,17 @@ const strings = {
     spacingComfortable: "Komdu",
     spacingRelaxed: "Miftuħ",
     articlesToday: "artikli",
+
+    // AI-generated content label
+    aiSummaryLabel: "Sommarju AI",
+
+    // Split confirmation + undo
+    splitSuccess: "Tneħħa mill-grupp",
+    undoAction: "Irrevoka",
+    storyHidden: "Storja moħbija",
+
+    // Bias bar legend (compact tap target)
+    showBiasLegend: "Uri d-deskrizzjoni tal-kopertura",
 
     groupingConfidence: "Raggruppament",
     groupingSingle: "Sors wieħed",

@@ -109,58 +109,46 @@ pub struct PipelineResult {
     pub failed_sources: Vec<String>,
 }
 
-/// Store → cluster by keywords → blindspot.
-fn process(
+/// Store new articles from a scrape batch, returning only those that were
+/// actually inserted (not already present).
+fn store_new_articles(
     db: &Pool<SqliteConnectionManager>,
-    raw_articles: Vec<RawArticle>,
-) -> Result<PipelineResult> {
-    let scraped_count = raw_articles.len();
-
-    // 1. Store new articles in a single transaction.
-    let new_articles = {
-        let conn = db.get()?;
-        conn.execute_batch("BEGIN")?;
-        let result: Result<Vec<crate::models::RawArticle>> = (|| {
-            let mut new = Vec::new();
-            for a in &raw_articles {
-                if db::insert_article(&conn, a)? {
-                    if !a.translated_headline.is_empty() {
-                        db::set_translated_headline(&conn, &a.id, &a.translated_headline)?;
-                    }
-                    new.push(a.clone());
+    raw_articles: &[RawArticle],
+) -> Result<Vec<RawArticle>> {
+    let conn = db.get()?;
+    conn.execute_batch("BEGIN")?;
+    let result: Result<Vec<RawArticle>> = (|| {
+        let mut new = Vec::new();
+        for a in raw_articles {
+            if db::insert_article(&conn, a)? {
+                if !a.translated_headline.is_empty() {
+                    db::set_translated_headline(&conn, &a.id, &a.translated_headline)?;
                 }
+                new.push(a.clone());
             }
-            Ok(new)
-        })();
-        match result {
-            Ok(new) => { conn.execute_batch("COMMIT")?; new }
-            Err(e) => { let _ = conn.execute_batch("ROLLBACK"); return Err(e); }
         }
-    };
-    drop(raw_articles);
-
-    let new_count = new_articles.len();
-    log::info!("{} new articles inserted", new_count);
-
-    if new_articles.is_empty() {
-        return Ok(PipelineResult {
-            articles_scraped: scraped_count,
-            articles_new: 0,
-            clusters_created: 0,
-            failed_sources: Vec::new(),
-        });
+        Ok(new)
+    })();
+    match result {
+        Ok(new) => { conn.execute_batch("COMMIT")?; Ok(new) }
+        Err(e) => { let _ = conn.execute_batch("ROLLBACK"); Err(e) }
     }
+}
 
+/// Greedy lexical cluster assignment + second-pass merge + blindspot pass.
+/// Used as a fallback when the embedding model is unavailable.
+fn lexical_pipeline(
+    db: &Pool<SqliteConnectionManager>,
+    new_articles: &[RawArticle],
+) -> Result<usize> {
     let conn = db.get()?;
 
-    // 2. Build cluster data map from DB.
-    // pub_map: cluster_id → (first_reported, last_updated, publisher_ids)
+    // Build cluster data map from DB.
     let mut pub_map: HashMap<String, (String, String, Vec<String>)> =
         db::load_cluster_publishers(&conn)?
             .into_iter()
             .map(|(cid, _, first, last, pubs)| (cid, (first, last, pubs)))
             .collect();
-    // article_data: cluster_id → Vec<(headline, translated, language, publisher_id, snippet, category)>
     let mut article_data: HashMap<String, Vec<(String, String, String, String, String, String)>> =
         db::load_all_cluster_headlines(&conn)?;
 
@@ -174,14 +162,10 @@ fn process(
 
         for (h, t, lang, _, _snippet, _) in articles {
             let en = if lang == "en" { h.clone() } else if !t.is_empty() { t.clone() } else { h.clone() };
-            // No URL available for already-stored articles, so skip slug for existing clusters
-            let text = en;
-            let tokens = clustering::tokenize_weighted(&text);
-            for tok in &tokens {
-                token_set.insert(tok.word.clone());
-            }
+            let tokens = clustering::tokenize_weighted(&en);
+            for tok in &tokens { token_set.insert(tok.word.clone()); }
             tokenized_headlines.push(tokens);
-            headlines.push(text);
+            headlines.push(en);
         }
 
         cluster_data.insert(cid.clone(), clustering::ClusterData {
@@ -195,18 +179,16 @@ fn process(
         });
     }
 
-    log::info!("{} existing clusters loaded for matching", cluster_data.len());
+    log::info!("{} existing clusters loaded for lexical matching", cluster_data.len());
 
     let mut idf = clustering::build_idf_table(&cluster_data);
     let mut new_vocab_since_refresh: usize = 0;
     const VOCAB_REFRESH_THRESHOLD: usize = 50;
-
-    // 3. Greedy per-article cluster assignment.
     let mut clusters_created = 0;
 
     conn.execute_batch("BEGIN")?;
     let cluster_result: Result<()> = (|| {
-        for article in &new_articles {
+        for article in new_articles {
             let headline = if article.language == "en" {
                 &article.original_headline
             } else if !article.translated_headline.is_empty() {
@@ -215,10 +197,7 @@ fn process(
                 &article.original_headline
             };
 
-            // Build cluster text: EN headline + snippet + URL slug (#4)
             let mut text = cluster_text(headline, &article.body_snippet, &article.original_url);
-
-            // Append MT proper nouns alongside the English translation (#19)
             if article.language != "en" {
                 let extras = mt_entity_words(&article.original_headline);
                 if !extras.is_empty() {
@@ -227,7 +206,6 @@ fn process(
             }
 
             let new_cluster_id = uuid::Uuid::new_v4().to_string();
-
             let assignment = clustering::assign_cluster(
                 &text,
                 &article.published_at,
@@ -242,7 +220,7 @@ fn process(
 
             if assignment.is_new {
                 clusters_created += 1;
-                log::info!("New cluster: {:?}", headline);
+                log::info!("New cluster (lexical): {:?}", headline);
 
                 let tokens = clustering::tokenize_weighted(&text);
                 let token_set: HashSet<String> = tokens.iter().map(|t| t.word.clone()).collect();
@@ -280,22 +258,14 @@ fn process(
                     article.category.clone(),
                 ));
 
-                db::upsert_cluster(
-                    &conn,
-                    &assignment.cluster_id,
-                    headline,
-                    &article.published_at,
-                    &article.published_at,
-                    false,
-                )?;
+                db::upsert_cluster(&conn, &assignment.cluster_id, headline,
+                    &article.published_at, &article.published_at, false)?;
             } else {
-                log::info!("Joined cluster: {} -> {}", headline, &assignment.cluster_id);
+                log::info!("Joined cluster (lexical): {} -> {}", headline, &assignment.cluster_id);
 
                 if let Some(data) = cluster_data.get_mut(&assignment.cluster_id) {
                     let tokens = clustering::tokenize_weighted(&text);
-                    for t in &tokens {
-                        data.token_set.insert(t.word.clone());
-                    }
+                    for t in &tokens { data.token_set.insert(t.word.clone()); }
                     data.tokenized_headlines.push(tokens);
                     data.headlines.push(text);
                     if article.published_at > data.last_updated {
@@ -312,12 +282,8 @@ fn process(
                 }
 
                 if let Some((_, last, pubs)) = pub_map.get_mut(&assignment.cluster_id) {
-                    if article.published_at > *last {
-                        *last = article.published_at.clone();
-                    }
-                    if !pubs.contains(&article.publisher_id) {
-                        pubs.push(article.publisher_id.clone());
-                    }
+                    if article.published_at > *last { *last = article.published_at.clone(); }
+                    if !pubs.contains(&article.publisher_id) { pubs.push(article.publisher_id.clone()); }
                 }
                 article_data.entry(assignment.cluster_id.clone()).or_default().push((
                     article.original_headline.clone(),
@@ -328,14 +294,8 @@ fn process(
                     article.category.clone(),
                 ));
 
-                db::upsert_cluster(
-                    &conn,
-                    &assignment.cluster_id,
-                    headline,
-                    &article.published_at,
-                    &article.published_at,
-                    false,
-                )?;
+                db::upsert_cluster(&conn, &assignment.cluster_id, headline,
+                    &article.published_at, &article.published_at, false)?;
             }
         }
         Ok(())
@@ -345,17 +305,14 @@ fn process(
         Err(e) => { let _ = conn.execute_batch("ROLLBACK"); return Err(e); }
     }
 
-    drop(new_articles);
-
-    // 4. Second-pass cluster-to-cluster merge (#7)
+    // Second-pass cluster-to-cluster merge.
     let merges = clustering::find_cluster_merges(&cluster_data, &idf);
     if !merges.is_empty() {
-        log::info!("Second-pass merge: {} cluster pairs", merges.len());
+        log::info!("Lexical second-pass merge: {} cluster pairs", merges.len());
         conn.execute_batch("BEGIN")?;
         let merge_result: Result<()> = (|| {
             for (from_id, to_id) in &merges {
                 db::merge_cluster_articles(&conn, from_id, to_id)?;
-                // Merge in-memory pub_map and article_data for the blindspot pass
                 if let Some((from_first, from_last, from_pubs)) = pub_map.remove(from_id) {
                     if let Some((_, to_last, to_pubs)) = pub_map.get_mut(to_id) {
                         if from_last > *to_last { *to_last = from_last; }
@@ -378,17 +335,15 @@ fn process(
 
     drop(cluster_data);
 
-    // 5. Blindspot analysis + best headline selection.
+    // Blindspot analysis + best headline selection.
     let empty_vec = Vec::new();
     conn.execute_batch("BEGIN")?;
     let blindspot_result: Result<()> = (|| {
         for (cid, (first, last, pub_ids)) in &pub_map {
             let pub_refs: Vec<&str> = pub_ids.iter().map(|s| s.as_str()).collect();
             let is_blind = clustering::is_blindspot(&pub_refs);
-
             let articles = article_data.get(cid).unwrap_or(&empty_vec);
             let best_headline = clustering::pick_best_headline(articles);
-
             db::upsert_cluster(&conn, cid, &best_headline, first, last, is_blind)?;
         }
         Ok(())
@@ -398,20 +353,64 @@ fn process(
         Err(e) => { let _ = conn.execute_batch("ROLLBACK"); return Err(e); }
     }
 
-    drop(conn);
-    let clusters_created = match semantic_clustering::recluster(db, false) {
-        Ok(Some(count)) => {
-            log::info!("semantic clustering complete: {} clusters", count);
-            count
-        }
-        Ok(None) => clusters_created,
-        Err(error) => {
-            log::warn!(
-                "semantic clustering failed; retaining lexical clusters: {error:#}"
+    Ok(clusters_created)
+}
+
+/// Store → cluster (semantic first, lexical fallback) → blindspot.
+///
+/// The semantic pipeline is the primary path. It embeds every article,
+/// scores all pairs, and persists coherent clusters in one atomic pass — also
+/// updating blindspot flags and best headlines. The greedy lexical path is
+/// retained as a fallback for when the on-device embedding model is unavailable.
+fn process(
+    db: &Pool<SqliteConnectionManager>,
+    raw_articles: Vec<RawArticle>,
+) -> Result<PipelineResult> {
+    let scraped_count = raw_articles.len();
+
+    // 1. Store new articles.
+    let new_articles = store_new_articles(db, &raw_articles)?;
+    drop(raw_articles);
+    let new_count = new_articles.len();
+    log::info!("{} new articles inserted", new_count);
+
+    if new_articles.is_empty() {
+        return Ok(PipelineResult {
+            articles_scraped: scraped_count,
+            articles_new: 0,
+            clusters_created: 0,
+            failed_sources: Vec::new(),
+        });
+    }
+
+    // 2. Semantic clustering — primary path.
+    //    recluster() returns Ok(None) when the embedding model hasn't loaded yet.
+    //    On success it handles everything: assignments, blindspot flags, and
+    //    headline selection. On failure or absence, fall through to lexical.
+    match semantic_clustering::recluster(db, false) {
+        Ok(Some(new_clusters)) => {
+            log::info!(
+                "semantic clustering complete: {} new clusters from {} new articles",
+                new_clusters,
+                new_count
             );
-            clusters_created
+            return Ok(PipelineResult {
+                articles_scraped: scraped_count,
+                articles_new: new_count,
+                clusters_created: new_clusters,
+                failed_sources: Vec::new(),
+            });
         }
-    };
+        Ok(None) => {
+            log::info!("embedding model unavailable; using lexical clustering fallback");
+        }
+        Err(error) => {
+            log::warn!("semantic clustering failed; using lexical fallback: {error:#}");
+        }
+    }
+
+    // 3. Lexical fallback.
+    let clusters_created = lexical_pipeline(db, &new_articles)?;
 
     Ok(PipelineResult {
         articles_scraped: scraped_count,
@@ -422,11 +421,14 @@ fn process(
 }
 
 /// Re-cluster every article already in the database without re-scraping.
+///
+/// Semantic is tried first (regenerating all embeddings). Falls back to the
+/// lexical pipeline if the embedding model is unavailable.
 pub fn recluster_all(db: &Pool<SqliteConnectionManager>) -> Result<PipelineResult> {
     match semantic_clustering::recluster(db, true) {
         Ok(Some(clusters_created)) => {
             log::info!(
-                "semantic force-reclustering complete: {} clusters",
+                "semantic force-reclustering complete: {} new clusters",
                 clusters_created
             );
             return Ok(PipelineResult {
@@ -436,190 +438,53 @@ pub fn recluster_all(db: &Pool<SqliteConnectionManager>) -> Result<PipelineResul
                 failed_sources: Vec::new(),
             });
         }
-        Ok(None) => {}
+        Ok(None) => {
+            log::info!("embedding model unavailable; using lexical fallback for force-recluster");
+        }
         Err(error) => {
-            log::warn!(
-                "semantic force-reclustering failed; using lexical fallback: {error:#}"
-            );
+            log::warn!("semantic force-reclustering failed; using lexical fallback: {error:#}");
         }
     }
 
-    let conn = db.get()?;
+    // Lexical fallback: wipe, then re-assign from scratch using the full article set.
+    {
+        let conn = db.get()?;
+        db::wipe_clusters(&conn)?;
+        log::info!("wiped all clusters for lexical re-clustering");
+    }
 
-    db::wipe_clusters(&conn)?;
-    log::info!("wiped all clusters for re-clustering");
+    let articles = {
+        let conn = db.get()?;
+        let rows = db::load_articles_for_recluster(&conn)?;
+        log::info!("{} articles to re-cluster", rows.len());
+        rows
+    };
 
-    let articles = db::load_articles_for_recluster(&conn)?;
-    log::info!("{} articles to re-cluster", articles.len());
-
-    let mut cluster_data: HashMap<String, clustering::ClusterData> = HashMap::new();
-    let mut pub_map: HashMap<String, (String, String, Vec<String>)> = HashMap::new();
-    let mut article_data: HashMap<String, Vec<(String, String, String, String, String, String)>> = HashMap::new();
-    let mut idf = clustering::build_idf_table(&cluster_data);
-    let mut new_vocab_since_refresh: usize = 0;
-    const VOCAB_REFRESH_THRESHOLD: usize = 50;
-    let mut clusters_created = 0;
-
-    conn.execute_batch("BEGIN")?;
-    let recluster_result: Result<()> = (|| {
-        for (article_id, original_headline, translated_headline, language, published_at, snippet, publisher_id, category, original_url) in &articles {
-            if scraper::is_non_article_headline(original_headline) {
-                log::debug!("skipping non-story during recluster: {:?}", original_headline);
-                continue;
-            }
-            let headline = if language == "en" {
-                original_headline
-            } else if !translated_headline.is_empty() {
-                translated_headline
-            } else {
-                original_headline
-            };
-
-            let mut text = cluster_text(headline, snippet, original_url);
-            if language != "en" {
-                let extras = mt_entity_words(original_headline);
-                if !extras.is_empty() {
-                    text = format!("{} . {}", text, extras);
-                }
-            }
-
-            let new_cluster_id = uuid::Uuid::new_v4().to_string();
-            let assignment = clustering::assign_cluster(
-                &text,
+    // Convert the flat article tuples into the RawArticle shape that
+    // lexical_pipeline expects.
+    let raw: Vec<RawArticle> = articles
+        .into_iter()
+        .filter(|(_, orig, _, _, _, _, _, _, _)| !scraper::is_non_article_headline(orig))
+        .map(|(id, orig, translated, lang, published_at, snippet, publisher_id, category, url)| {
+            RawArticle {
+                id,
+                publisher_id,
+                original_url: url,
+                original_headline: orig,
+                translated_headline: translated,
+                body_snippet: snippet,
+                body_text: String::new(),
+                image_url: String::new(),
+                language: lang,
                 published_at,
                 category,
-                publisher_id,
-                &cluster_data,
-                &idf,
-                &new_cluster_id,
-            );
-
-            db::set_cluster(&conn, article_id, &assignment.cluster_id)?;
-
-            if assignment.is_new {
-                clusters_created += 1;
-                let tokens = clustering::tokenize_weighted(&text);
-                let token_set: HashSet<String> = tokens.iter().map(|t| t.word.clone()).collect();
-                new_vocab_since_refresh += token_set.iter().filter(|w| !idf.contains_key(w.as_str())).count();
-
-                let mut pub_set = HashSet::new();
-                pub_set.insert(publisher_id.clone());
-
-                cluster_data.insert(assignment.cluster_id.clone(), clustering::ClusterData {
-                    headlines: vec![text.clone()],
-                    tokenized_headlines: vec![tokens],
-                    token_set,
-                    last_updated: published_at.clone(),
-                    category: Some(category.clone()),
-                    category_counts: HashMap::from([(category.clone(), 1)]),
-                    publisher_ids: pub_set,
-                });
-
-                if new_vocab_since_refresh >= VOCAB_REFRESH_THRESHOLD {
-                    idf = clustering::build_idf_table(&cluster_data);
-                    new_vocab_since_refresh = 0;
-                }
-
-                pub_map.insert(assignment.cluster_id.clone(), (
-                    published_at.clone(),
-                    published_at.clone(),
-                    vec![publisher_id.clone()],
-                ));
-                article_data.entry(assignment.cluster_id.clone()).or_default().push((
-                    original_headline.clone(),
-                    translated_headline.clone(),
-                    language.clone(),
-                    publisher_id.clone(),
-                    snippet.clone(),
-                    category.clone(),
-                ));
-                db::upsert_cluster(&conn, &assignment.cluster_id, headline, published_at, published_at, false)?;
-            } else {
-                if let Some(data) = cluster_data.get_mut(&assignment.cluster_id) {
-                    let tokens = clustering::tokenize_weighted(&text);
-                    for t in &tokens { data.token_set.insert(t.word.clone()); }
-                    data.tokenized_headlines.push(tokens);
-                    data.headlines.push(text);
-                    if published_at > &data.last_updated { data.last_updated = published_at.clone(); }
-                    data.publisher_ids.insert(publisher_id.clone());
-                    *data.category_counts.entry(category.clone()).or_insert(0) += 1;
-                    let cats: Vec<&str> = data
-                        .category_counts
-                        .iter()
-                        .flat_map(|(cat, count)| std::iter::repeat(cat.as_str()).take(*count))
-                        .collect();
-                    data.category = Some(dominant_category(&cats));
-                }
-                if let Some((_, last, pubs)) = pub_map.get_mut(&assignment.cluster_id) {
-                    if published_at > last { *last = published_at.clone(); }
-                    if !pubs.contains(publisher_id) { pubs.push(publisher_id.clone()); }
-                }
-                article_data.entry(assignment.cluster_id.clone()).or_default().push((
-                    original_headline.clone(),
-                    translated_headline.clone(),
-                    language.clone(),
-                    publisher_id.clone(),
-                    snippet.clone(),
-                    category.clone(),
-                ));
-                db::upsert_cluster(&conn, &assignment.cluster_id, headline, published_at, published_at, false)?;
             }
-        }
-        Ok(())
-    })();
-    match recluster_result {
-        Ok(()) => conn.execute_batch("COMMIT")?,
-        Err(e) => { let _ = conn.execute_batch("ROLLBACK"); return Err(e); }
-    }
+        })
+        .collect();
 
-    // Second-pass merge for recluster
-    let merges = clustering::find_cluster_merges(&cluster_data, &idf);
-    if !merges.is_empty() {
-        log::info!("Recluster second-pass merge: {} pairs", merges.len());
-        conn.execute_batch("BEGIN")?;
-        let merge_result: Result<()> = (|| {
-            for (from_id, to_id) in &merges {
-                db::merge_cluster_articles(&conn, from_id, to_id)?;
-                if let Some((from_first, from_last, from_pubs)) = pub_map.remove(from_id) {
-                    if let Some((_, to_last, to_pubs)) = pub_map.get_mut(to_id) {
-                        if from_last > *to_last { *to_last = from_last; }
-                        for p in from_pubs { if !to_pubs.contains(&p) { to_pubs.push(p); } }
-                    } else {
-                        pub_map.insert(to_id.clone(), (from_first, from_last, from_pubs));
-                    }
-                }
-                if let Some(from_articles) = article_data.remove(from_id) {
-                    article_data.entry(to_id.clone()).or_default().extend(from_articles);
-                }
-            }
-            Ok(())
-        })();
-        match merge_result {
-            Ok(()) => conn.execute_batch("COMMIT")?,
-            Err(e) => { let _ = conn.execute_batch("ROLLBACK"); log::warn!("recluster merge pass failed: {}", e); }
-        }
-    }
+    let clusters_created = lexical_pipeline(db, &raw)?;
+    log::info!("lexical re-clustering complete: {} clusters", clusters_created);
 
-    drop(cluster_data);
-
-    let empty_vec = Vec::new();
-    conn.execute_batch("BEGIN")?;
-    let blindspot_result: Result<()> = (|| {
-        for (cid, (first, last, pub_ids)) in &pub_map {
-            let pub_refs: Vec<&str> = pub_ids.iter().map(|s| s.as_str()).collect();
-            let is_blind = clustering::is_blindspot(&pub_refs);
-            let articles = article_data.get(cid).unwrap_or(&empty_vec);
-            let best_headline = clustering::pick_best_headline(articles);
-            db::upsert_cluster(&conn, cid, &best_headline, first, last, is_blind)?;
-        }
-        Ok(())
-    })();
-    match blindspot_result {
-        Ok(()) => conn.execute_batch("COMMIT")?,
-        Err(e) => { let _ = conn.execute_batch("ROLLBACK"); return Err(e); }
-    }
-
-    log::info!("re-clustering complete: {} clusters", clusters_created);
     Ok(PipelineResult {
         articles_scraped: 0,
         articles_new: 0,

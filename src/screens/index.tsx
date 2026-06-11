@@ -1,9 +1,10 @@
 import { useState, useEffect, useCallback, useRef, useMemo } from "react";
 import { useQueryClient } from "@tanstack/react-query";
 import { formatDistanceToNow } from "date-fns";
+import { enUS } from "date-fns/locale";
 import { invoke } from "@tauri-apps/api/core";
-import { ArrowLeft, Check, ChevronDown, ChevronRight, ExternalLink, Filter, Info, MoreHorizontal, Plus, Search, Settings2, Trash2, X } from "lucide-react";
-import { useClusters, usePublishers, useSavedStories, refreshFeed, searchStories, saveStory, unsaveStory, getRefreshStatus, addCustomPublisher, removeCustomPublisher, splitCluster, forceRecluster, wipeAllData, clusterKeys } from "@/api/clusters";
+import { ArrowLeft, Check, ChevronDown, ChevronRight, ExternalLink, Info, MoreHorizontal, Plus, RefreshCw, Search, Settings2, Trash2, X } from "lucide-react";
+import { useClusters, usePublishers, useSavedStories, refreshFeed, searchStories, saveStory, unsaveStory, getRefreshStatus, addCustomPublisher, removeCustomPublisher, splitCluster, revertSplit, forceRecluster, wipeAllData, clusterKeys } from "@/api/clusters";
 import { StoryCard } from "@/components/StoryCard/StoryCard";
 import { BiasBar } from "@/components/BiasBar/BiasBar";
 import { computeBiasCoverage } from "@/utils/bias";
@@ -298,7 +299,28 @@ export function StoryDetailScreen({
   const [advancedTermsOpen, setAdvancedTermsOpen] = useState(false);
   const [reviewOpen, setReviewOpen] = useState(false);
   const [groupMenuOpen, setGroupMenuOpen] = useState(false);
+  const groupMenuRef = useRef<HTMLDivElement>(null);
   const groupEvidence = useMemo(() => groupingEvidence(cluster), [cluster]);
+  // Split confirmation: splitTarget is the article pending confirmation.
+  const [splitTarget, setSplitTarget] = useState<Article | null>(null);
+  // Undo toast: splitUndoTarget is the article that was just split.
+  const [splitUndoTarget, setSplitUndoTarget] = useState<Article | null>(null);
+  const splitUndoTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  // Close group popover on outside click or Escape.
+  useEffect(() => {
+    if (!groupMenuOpen) return;
+    const onDown = (e: MouseEvent) => {
+      if (groupMenuRef.current && !groupMenuRef.current.contains(e.target as Node)) setGroupMenuOpen(false);
+    };
+    const onKey = (e: KeyboardEvent) => { if (e.key === "Escape") setGroupMenuOpen(false); };
+    document.addEventListener("mousedown", onDown);
+    document.addEventListener("keydown", onKey);
+    return () => {
+      document.removeEventListener("mousedown", onDown);
+      document.removeEventListener("keydown", onKey);
+    };
+  }, [groupMenuOpen]);
 
   const sortedByTime = useMemo(() =>
     [...cluster.articles].sort((a, b) => a.published_at.localeCompare(b.published_at)),
@@ -418,17 +440,46 @@ export function StoryDetailScreen({
     }
   }, [summaries]);
 
-  const handleSplit = useCallback(async (article: Article) => {
+  // Step 1: user taps the trash icon → ask for confirmation.
+  const handleSplitRequest = useCallback((article: Article) => {
+    setSplitTarget(article);
+  }, []);
+
+  // Step 2: user confirms → execute split + show undo toast.
+  const handleSplitConfirm = useCallback(async () => {
+    if (!splitTarget) return;
+    const article = splitTarget;
     const headline = article.language === "en" ? article.original_headline : (article.translated_headline || article.original_headline);
+    setSplitTarget(null);
     setDetailActionError(null);
     try {
       await splitCluster(article.id, headline, article.published_at);
       await queryClient.invalidateQueries({ queryKey: clusterKeys.all() });
+      // Show undo toast with a 6-second window.
+      setSplitUndoTarget(article);
+      if (splitUndoTimerRef.current) clearTimeout(splitUndoTimerRef.current);
+      splitUndoTimerRef.current = setTimeout(() => setSplitUndoTarget(null), 6000);
     } catch (err) {
       setDetailActionError(t(lang, "splitClusterError"));
       console.error("split cluster failed:", err);
     }
-  }, [lang, queryClient]);
+  }, [splitTarget, lang, queryClient]);
+
+  // Undo: move article back to its previous cluster + remove cannot-link constraint.
+  const handleSplitUndo = useCallback(async () => {
+    if (!splitTarget && !splitUndoTarget) return;
+    const article = splitUndoTarget;
+    setSplitUndoTarget(null);
+    setSplitTarget(null);
+    if (splitUndoTimerRef.current) clearTimeout(splitUndoTimerRef.current);
+    if (!article) return;
+    try {
+      await revertSplit(article.id);
+      await queryClient.invalidateQueries({ queryKey: clusterKeys.all() });
+    } catch (err) {
+      console.error("revert split failed:", err);
+    }
+  }, [splitUndoTarget, splitTarget, queryClient]);
 
   // ── Article Reader View
   if (selectedArticle) {
@@ -441,7 +492,7 @@ export function StoryDetailScreen({
           <button className="overlay-icon-btn" onClick={() => setSelectedArticle(null)} aria-label={t(lang, "back")}><ArrowLeft size={21} /></button>
           <div className="overlay-title">
             <span>{a.publisher.name}</span>
-            <small>{formatDistanceToNow(new Date(a.published_at), { addSuffix: true })}</small>
+            <small>{formatDistanceToNow(new Date(a.published_at), { addSuffix: true, locale: enUS })}</small>
           </div>
           <a className="overlay-icon-btn" href={a.original_url} target="_blank" rel="noopener noreferrer" aria-label={`${t(lang, "readOn")} ${selectedDomain}`}><ExternalLink size={18} /></a>
         </header>
@@ -538,7 +589,7 @@ export function StoryDetailScreen({
       <header className="overlay-topbar">
         <button className="overlay-icon-btn" onClick={onBack} aria-label={t(lang, "back")}><ArrowLeft size={21} /></button>
         <span className="overlay-title single">{t(lang, "storyGroup")}</span>
-        <div className="detail-menu-wrap">
+        <div className="detail-menu-wrap" ref={groupMenuRef}>
           <button className="overlay-icon-btn" onClick={() => setGroupMenuOpen(open => !open)} aria-label={t(lang, "moreActions")} aria-expanded={groupMenuOpen}><MoreHorizontal size={21} /></button>
           {groupMenuOpen && (
             <button className="detail-menu-popover" onClick={() => { setReviewOpen(true); setGroupMenuOpen(false); }}>
@@ -619,7 +670,7 @@ export function StoryDetailScreen({
                 if (!article) return null;
                 return (
                   <button key={item.article_id} className="comparison-row" onClick={() => openArticle(article)}>
-                    <span><strong>{item.publisher_name}</strong><small>{formatDistanceToNow(new Date(item.published_at), { addSuffix: true })}</small></span>
+                    <span><strong>{item.publisher_name}</strong><small>{formatDistanceToNow(new Date(item.published_at), { addSuffix: true, locale: enUS })}</small></span>
                     <p>{articleHeadline(article, lang)}</p>
                     <ChevronRight size={16} />
                   </button>
@@ -646,7 +697,7 @@ export function StoryDetailScreen({
                       {a.publisher.name}
                       {i === 0 && <span className="timeline-first"> · {t(lang, "brokeTheStory")}</span>}
                     </span>
-                    <span className="timeline-time">{formatDistanceToNow(new Date(a.published_at), { addSuffix: true })}</span>
+                    <span className="timeline-time">{formatDistanceToNow(new Date(a.published_at), { addSuffix: true, locale: enUS })}</span>
                     <span className="timeline-headline">{articleHeadline(a, lang)}</span>
                   </div>
                 </div>
@@ -671,10 +722,27 @@ export function StoryDetailScreen({
               {cluster.articles.map(article => (
                 <div key={article.id} className="review-source-row">
                   <div><strong>{article.publisher.name}</strong><span>{articleHeadline(article, lang)}</span></div>
-                  <button onClick={() => handleSplit(article)} aria-label={`${t(lang, "splitFromCluster")}: ${article.publisher.name}`}><Trash2 size={16} /></button>
+                  {splitTarget?.id === article.id ? (
+                    <div className="split-confirm-inline">
+                      <button className="split-confirm-yes" onClick={handleSplitConfirm}>
+                        {t(lang, "splitFromCluster")}
+                      </button>
+                      <button className="split-confirm-no" onClick={() => setSplitTarget(null)}>
+                        {t(lang, "cancel")}
+                      </button>
+                    </div>
+                  ) : (
+                    <button onClick={() => handleSplitRequest(article)} aria-label={`${t(lang, "splitFromCluster")}: ${article.publisher.name}`}><Trash2 size={16} /></button>
+                  )}
                 </div>
               ))}
             </div>
+            {splitUndoTarget && (
+              <div className="action-toast">
+                <span>{t(lang, "splitSuccess")}</span>
+                <button onClick={handleSplitUndo}>{t(lang, "undoAction")}</button>
+              </div>
+            )}
           </section>
         </div>
       )}
@@ -702,7 +770,8 @@ function CardSkeleton({ delay = "0s" }: { delay?: string }) {
 
 // ── Feed Screen ─────────────────────────────────────────────────────────────
 
-const ALL_CATEGORIES: ("all" | Category)[] = ["all", "politics", "sport", "local", "international", "crime", "business", "opinion", "entertainment", "general"];
+// "general" omitted — it's a system category that means nothing to readers.
+const ALL_CATEGORIES: ("all" | Category)[] = ["all", "politics", "sport", "local", "international", "crime", "business", "opinion", "entertainment"];
 const CAT_I18N: Record<string, import("@/utils/i18n").LangKey> = {
   all: "catAll", politics: "catPolitics", sport: "catSport", local: "catLocal",
   international: "catInternational", crime: "catCrime", business: "catBusiness",
@@ -716,7 +785,9 @@ const GROUPING_I18N: Record<ReturnType<typeof groupingEvidence>["level"], import
 };
 
 export type FeedFilter = "local" | "global";
-type FeedSort = "balanced" | "latest" | "covered" | "blindspots";
+// "blindspots" removed — it's a root tab view, not a sort mode. Sorting by blindspot
+// produced a subtly different result from the Blindspots tab and confused the distinction.
+type FeedSort = "balanced" | "latest" | "covered";
 type FeedRootView = "feed" | "blindspots" | "saved";
 
 const INDEPENDENT_BIAS: BiasCategory[] = ["commercial_independent", "investigative_independent"];
@@ -756,13 +827,19 @@ export function FeedScreen({
   const { data, isLoading, isError, refetch } = useClusters();
   const { data: savedData, refetch: refetchSaved } = useSavedStories();
   const { data: publishers = [], isLoading: publishersLoading } = usePublishers();
+  const dismissedIdsArr = useAppStore(s => s.dismissedIds);
+  const dismissStory = useAppStore(s => s.dismissStory);
+  const undismissStory = useAppStore(s => s.undismissStory);
+  const dismissedIds = useMemo(() => new Set(dismissedIdsArr), [dismissedIdsArr]);
+  // Undo state for swipe-to-dismiss (5-second window).
+  const [dismissUndoTarget, setDismissUndoTarget] = useState<string | null>(null);
+  const dismissUndoTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+
   const [refreshing, setRefreshing] = useState(false);
   const [activeCategory, setActiveCategory] = useState<"all" | Category>("all");
   const [feedSort, setFeedSort] = useState<FeedSort>("balanced");
-  const [filtersOpen, setFiltersOpen] = useState(false);
   const [failedSources, setFailedSources] = useState<string[]>([]);
   const [refreshError, setRefreshError] = useState<string | null>(null);
-  const [dismissedIds, setDismissedIds] = useState<Set<string>>(new Set());
   const [searchQuery, setSearchQuery] = useState("");
   const [searchResult, setSearchResult] = useState<StoryCluster[] | null>(null);
   const [searching, setSearching] = useState(false);
@@ -836,8 +913,6 @@ export function FeedScreen({
       arr.sort((a, b) => b.last_updated.localeCompare(a.last_updated));
     } else if (feedSort === "covered") {
       arr.sort((a, b) => b.articles.length - a.articles.length || b.last_updated.localeCompare(a.last_updated));
-    } else if (feedSort === "blindspots") {
-      arr.sort((a, b) => Number(b.is_blindspot) - Number(a.is_blindspot) || b.last_updated.localeCompare(a.last_updated));
     } else {
       const score = (cluster: StoryCluster) => {
         const publisherCount = new Set(cluster.articles.map(a => a.publisher_id)).size;
@@ -881,7 +956,7 @@ export function FeedScreen({
     getRefreshStatus()
       .then(status => {
         if (status.last_refresh_at) {
-          setLastRefreshLabel(formatDistanceToNow(new Date(status.last_refresh_at), { addSuffix: true }));
+          setLastRefreshLabel(formatDistanceToNow(new Date(status.last_refresh_at), { addSuffix: true, locale: enUS }));
         }
         if (status.failed_sources.length > 0) setFailedSources(status.failed_sources);
       })
@@ -901,7 +976,7 @@ export function FeedScreen({
       await refetch();
       await refetchSaved();
       const status = await getRefreshStatus().catch(() => null);
-      if (status?.last_refresh_at) setLastRefreshLabel(formatDistanceToNow(new Date(status.last_refresh_at), { addSuffix: true }));
+      if (status?.last_refresh_at) setLastRefreshLabel(formatDistanceToNow(new Date(status.last_refresh_at), { addSuffix: true, locale: enUS }));
     } catch (e) {
       console.error("refresh failed:", e);
       setRefreshError(errorMessage(e));
@@ -925,6 +1000,21 @@ export function FeedScreen({
       setRefreshError(errorMessage(err));
     }
   }, [queryClient, refetchSaved, savedStoryKeys, setStorySaved]);
+
+  const handleDismiss = useCallback((id: string) => {
+    dismissStory(id);
+    setDismissUndoTarget(id);
+    if (dismissUndoTimerRef.current) clearTimeout(dismissUndoTimerRef.current);
+    dismissUndoTimerRef.current = setTimeout(() => setDismissUndoTarget(null), 5000);
+  }, [dismissStory]);
+
+  const handleUndoDismiss = useCallback(() => {
+    if (dismissUndoTarget) {
+      undismissStory(dismissUndoTarget);
+      setDismissUndoTarget(null);
+      if (dismissUndoTimerRef.current) clearTimeout(dismissUndoTimerRef.current);
+    }
+  }, [dismissUndoTarget, undismissStory]);
 
   const { containerRef, pullDistance, refreshing: pullRefreshing, progress } = usePullToRefresh(
     handleRefresh, !isLoading && !refreshing && rawClusters.length > 0,
@@ -1079,8 +1169,13 @@ export function FeedScreen({
               <Info size={18} />
             </button>
           )}
-          <button className={`header-filter-btn${filtersOpen ? " active" : ""}`} onClick={() => setFiltersOpen(open => !open)} aria-label={t(lang, "filters")} aria-expanded={filtersOpen}>
-            <Filter size={18} />
+          <button
+            className="header-filter-btn"
+            onClick={handleRefresh}
+            disabled={isRefreshing}
+            aria-label={t(lang, "refresh")}
+          >
+            <RefreshCw size={18} className={isRefreshing ? "animate-spin" : ""} />
           </button>
         </div>
       </header>
@@ -1114,18 +1209,14 @@ export function FeedScreen({
           </button>
         ))}
       </div>
-      {filtersOpen && (
-        <div className="feed-filter-panel">
-          <span>{t(lang, "feedSort")}</span>
-          <div className="filter-options">
-            {([["balanced", "sortBalanced"], ["latest", "sortLatest"], ["covered", "sortCovered"], ["blindspots", "sortBlindspots"]] as const).map(([value, label]) => (
-              <button key={value} data-active={feedSort === value} onClick={() => { setFeedSort(value); setFiltersOpen(false); }}>
-                {t(lang, label)} {feedSort === value && <Check size={15} />}
-              </button>
-            ))}
-          </div>
-        </div>
-      )}
+      {/* Sort tabs — always visible so users can discover them without hunting for a filter icon */}
+      <div className="feed-sort-tabs" role="group" aria-label={t(lang, "feedSort")}>
+        {([["balanced", "sortBalanced"], ["latest", "sortLatest"], ["covered", "sortCovered"]] as const).map(([value, label]) => (
+          <button key={value} data-active={feedSort === value} aria-pressed={feedSort === value} onClick={() => setFeedSort(value)}>
+            {t(lang, label)}
+          </button>
+        ))}
+      </div>
 
       {/* Category filter pills */}
       {(
@@ -1147,20 +1238,27 @@ export function FeedScreen({
         {clusters.filter(c => !dismissedIds.has(c.id)).map((c, i) => (
           <SwipeToDismiss
             key={c.id}
-            onDismiss={() => setDismissedIds(s => new Set(s).add(c.id))}
+            onDismiss={() => handleDismiss(c.id)}
           >
             <StoryCard
               cluster={c}
               onPress={onSelectCluster}
               isSaved={savedStoryKeySet.has(c.story_key)}
               onToggleSaved={toggleSaved}
-              onDismiss={(id) => setDismissedIds(s => new Set(s).add(id))}
+              onDismiss={handleDismiss}
               animationDelay={`${Math.min(i * 0.05, 0.3)}s`}
             />
           </SwipeToDismiss>
         ))}
       </div>
 
+      {/* Undo toast for swipe-to-dismiss */}
+      {dismissUndoTarget && (
+        <div className="action-toast">
+          <span>{t(lang, "storyHidden")}</span>
+          <button onClick={handleUndoDismiss}>{t(lang, "undoAction")}</button>
+        </div>
+      )}
     </div>
   );
 }

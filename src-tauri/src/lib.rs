@@ -1107,6 +1107,17 @@ async fn split_cluster(
     split_cluster_core(&state, article_id, headline, published_at).await
 }
 
+/// Undo a user-initiated cluster split: moves the article back to its prior cluster
+/// and removes the cannot-link constraint so future reclusters can re-merge it.
+#[tauri::command]
+fn revert_split(
+    state: tauri::State<'_, MerillCore>,
+    article_id: String,
+) -> Result<(), String> {
+    let conn = state.db.get().map_err(|e| e.to_string())?;
+    db::revert_user_split(&conn, &article_id).map_err(|e| e.to_string())
+}
+
 /// Delete all articles and clusters and reset the scrape cooldown.
 pub(crate) fn wipe_all_data_core(state: &MerillCore) -> Result<(), String> {
     let conn = state.db.get().map_err(|e| e.to_string())?;
@@ -1185,7 +1196,7 @@ pub fn run() {
             Ok(())
         })
         .plugin(tauri_plugin_opener::init())
-        .invoke_handler(tauri::generate_handler![get_clusters, get_saved_stories, search_stories, save_story, unsave_story, get_refresh_status, get_publishers, refresh_feed, fetch_article_body, translate_summary, generate_cluster_summary, add_custom_publisher, remove_custom_publisher, split_cluster, force_recluster, wipe_all_data])
+        .invoke_handler(tauri::generate_handler![get_clusters, get_saved_stories, search_stories, save_story, unsave_story, get_refresh_status, get_publishers, refresh_feed, fetch_article_body, translate_summary, generate_cluster_summary, add_custom_publisher, remove_custom_publisher, split_cluster, revert_split, force_recluster, wipe_all_data])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
 }

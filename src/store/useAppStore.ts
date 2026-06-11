@@ -32,6 +32,10 @@ interface AppState extends AppSettings {
   setReaderTextMode: (mode: ReaderTextMode) => void;
   onboardingComplete: boolean;
   setOnboardingComplete: (complete: boolean) => void;
+  // Stories the user has explicitly hidden — persisted so they don't come back on relaunch.
+  dismissedIds: string[];
+  dismissStory: (id: string) => void;
+  undismissStory: (id: string) => void;
 }
 
 // Mutable ref holding the previous session's timestamp.
@@ -53,6 +57,7 @@ export const useAppStore = create<AppState>()(persist((set, get) => ({
   readerLineSpacing: "comfortable",
   readerTextMode: "translated",
   onboardingComplete: false,
+  dismissedIds: [],
 
   setTheme: (theme) => set({ theme }),
   setLanguage: (language) => set({ language }),
@@ -96,6 +101,8 @@ export const useAppStore = create<AppState>()(persist((set, get) => ({
   setReaderLineSpacing: (readerLineSpacing) => set({ readerLineSpacing }),
   setReaderTextMode: (readerTextMode) => set({ readerTextMode }),
   setOnboardingComplete: (onboardingComplete) => set({ onboardingComplete }),
+  dismissStory: (id) => set(s => ({ dismissedIds: [...s.dismissedIds, id] })),
+  undismissStory: (id) => set(s => ({ dismissedIds: s.dismissedIds.filter(d => d !== id) })),
 }), {
   name: "malta-news-settings",
   storage: createJSONStorage(() => localStorage),
@@ -113,6 +120,7 @@ export const useAppStore = create<AppState>()(persist((set, get) => ({
     readerLineSpacing: s.readerLineSpacing,
     readerTextMode: s.readerTextMode,
     onboardingComplete: s.onboardingComplete,
+    dismissedIds: s.dismissedIds,
   }),
   version: 2,
   migrate: (persisted, version) => {

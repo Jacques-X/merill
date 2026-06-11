@@ -69,6 +69,14 @@ export async function splitCluster(articleId: string, headline: string, publishe
   return invoke<string>("split_cluster", { articleId, headline, publishedAt });
 }
 
+/**
+ * Undo a split: removes the cannot-link constraint and moves the article back
+ * to its previous cluster. No-ops if the constraint no longer exists.
+ */
+export async function revertSplit(articleId: string): Promise<void> {
+  return invoke<void>("revert_split", { articleId });
+}
+
 export async function forceRecluster(): Promise<string> {
   return invoke<string>("force_recluster");
 }

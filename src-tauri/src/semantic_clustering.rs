@@ -234,12 +234,68 @@ fn recluster_with_engine(
         return Ok(0);
     }
 
+    // Snapshot existing cluster IDs so we can report *newly created* clusters,
+    // not the total count (which is what plans.len() gives).
+    let existing_cluster_ids: std::collections::HashSet<String> = {
+        let mut stmt = conn.prepare("SELECT id FROM clusters")?;
+        let rows: rusqlite::Result<Vec<String>> =
+            stmt.query_map([], |row| row.get::<_, String>(0))?.collect();
+        rows?.into_iter().collect()
+    };
+
+    // Load user-initiated split constraints so recluster never re-merges an
+    // article back into the cluster the user manually removed it from.
+    // The constraint is stored as (article_id, old_cluster_id); we convert
+    // it into a set of (article_index, article_index) pairs to block in
+    // build_components.
+    let raw_splits = db::load_cannot_link_pairs(conn)?;
+    let article_id_to_index: HashMap<&str, usize> = articles
+        .iter()
+        .enumerate()
+        .map(|(i, a)| (a.id.as_str(), i))
+        .collect();
+    // Build a set of (left, right) article-index pairs that must not be merged.
+    // An article that was split from cluster C must not be placed back with any
+    // article whose *current* old_cluster_id matches C.
+    let cannot_link: HashSet<(usize, usize)> = raw_splits
+        .iter()
+        .flat_map(|(split_article_id, old_cluster_id)| {
+            let Some(&split_idx) = article_id_to_index.get(split_article_id.as_str()) else {
+                return vec![];
+            };
+            articles
+                .iter()
+                .enumerate()
+                .filter(|(other_idx, other)| {
+                    *other_idx != split_idx
+                        && other
+                            .old_cluster_id
+                            .as_deref()
+                            .is_some_and(|cid| cid == old_cluster_id)
+                })
+                .map(|(other_idx, _)| {
+                    let (l, r) = if split_idx < other_idx {
+                        (split_idx, other_idx)
+                    } else {
+                        (other_idx, split_idx)
+                    };
+                    (l, r)
+                })
+                .collect()
+        })
+        .collect();
+
     populate_embeddings(&mut articles, engine, regenerate_embeddings)?;
     let decisions = score_pairs(&articles);
-    let components = build_components(&articles, &decisions);
+    let components = build_components(&articles, &decisions, &cannot_link);
     let plans = assign_stable_cluster_ids(conn, &articles, components)?;
     persist_plan(conn, &articles, &plans, &decisions)?;
-    Ok(plans.len())
+
+    let new_clusters = plans
+        .iter()
+        .filter(|p| !existing_cluster_ids.contains(&p.cluster_id))
+        .count();
+    Ok(new_clusters)
 }
 
 fn load_articles(conn: &Connection) -> Result<Vec<SemanticArticle>> {
@@ -396,7 +452,9 @@ fn score_pair(
     } else if a.category == "general" || b.category == "general" {
         0.55
     } else {
-        0.0
+        // Partial credit instead of 0 — cross-category stories do sometimes
+        // genuinely belong together (crime/politics, business/local, etc.).
+        0.30
     };
     let time = (-hours / 48.0).exp();
     let same_publisher_penalty = if a.publisher_id == b.publisher_id {
@@ -405,14 +463,47 @@ fn score_pair(
         0.0
     };
     let veto = contradiction(&a.facts, &b.facts, semantic);
-    let score = 0.65 * semantic
-        + 0.15 * lexical
-        + 0.10 * entity
-        + 0.05 * category
-        + 0.05 * time
-        - same_publisher_penalty;
-    let follow_up_evidence =
-        hours <= PRIMARY_WINDOW_HOURS || (semantic >= 0.84 && (entity > 0.0 || lexical >= 0.25));
+
+    // Cross-language pairs: lexical score is structurally near-zero because the
+    // token sets are from different languages. Redistribute the lexical weight
+    // onto semantic + entity so these pairs are judged on meaning, not surface form.
+    let cross_language = a.language != b.language;
+    let score = if cross_language {
+        0.75 * semantic + 0.15 * entity + 0.05 * category + 0.05 * time - same_publisher_penalty
+    } else {
+        0.65 * semantic
+            + 0.15 * lexical
+            + 0.10 * entity
+            + 0.05 * category
+            + 0.05 * time
+            - same_publisher_penalty
+    };
+
+    // Primary follow-up window: articles within 72h are always eligible for
+    // scoring. Beyond that, require strong semantic + supporting evidence.
+    // Slow-burn stories (crime sagas, political inquiries) get a slightly relaxed
+    // gate: they can satisfy the window with high semantic alone if a shared
+    // entity anchor exists.
+    let is_slow_burn = a.category == "crime"
+        || a.category == "politics"
+        || b.category == "crime"
+        || b.category == "politics";
+    let follow_up_evidence = hours <= PRIMARY_WINDOW_HOURS
+        || (semantic >= 0.84 && (entity > 0.0 || lexical >= 0.25))
+        || (is_slow_burn && semantic >= 0.87 && entity > 0.0);
+
+    // Two-tier acceptance:
+    //   • Primary gate: score ≥ AUTO_MATCH_THRESHOLD (0.80) — standard precision gate.
+    //   • Ambiguous band (0.70–0.80): accept if a shared rare entity anchor exists
+    //     and there is no veto. This recovers near-misses without lowering the
+    //     global precision gate.
+    let in_ambiguous_band =
+        score >= AMBIGUOUS_THRESHOLD && score < AUTO_MATCH_THRESHOLD;
+    // "Rare anchor" proxy: meaningful entity overlap (not just a common name).
+    // overlap_ratio ≥ 0.25 means at least 25 % of the smaller entity set is shared.
+    let has_entity_anchor = entity >= 0.25;
+    let ambiguous_accept = in_ambiguous_band && has_entity_anchor && veto.is_none() && follow_up_evidence;
+
     PairDecision {
         left,
         right,
@@ -427,58 +518,126 @@ fn score_pair(
             same_publisher_penalty,
         },
         veto,
-        eligible: veto.is_none() && follow_up_evidence && score >= AUTO_MATCH_THRESHOLD,
+        eligible: (veto.is_none() && follow_up_evidence && score >= AUTO_MATCH_THRESHOLD)
+            || ambiguous_accept,
     }
 }
 
 fn contradiction(a: &EventFacts, b: &EventFacts, semantic: f32) -> Option<&'static str> {
+    // Conflicting numbers only veto below 0.85 — above that, differing figures
+    // almost always indicate an update to the same developing story
+    // (e.g. "2 dead" → "death toll rises to 3").
     if !a.numbers.is_empty()
         && !b.numbers.is_empty()
         && a.numbers.is_disjoint(&b.numbers)
+        && semantic < 0.85
     {
         return Some("conflicting-numbers");
     }
+    // Conflicting locations veto below 0.85 — national angle vs. town-specific
+    // coverage of the same event should be allowed through at high semantic similarity.
     if !a.locations.is_empty()
         && !b.locations.is_empty()
         && a.locations.is_disjoint(&b.locations)
-        && semantic < 0.90
+        && semantic < 0.85
     {
         return Some("conflicting-locations");
     }
     None
 }
 
+/// Path-halving union-find for O(α(n)) cluster lookups.
+struct UnionFind {
+    parent: Vec<usize>,
+}
+
+impl UnionFind {
+    fn new(n: usize) -> Self {
+        UnionFind {
+            parent: (0..n).collect(),
+        }
+    }
+
+    fn find(&mut self, mut x: usize) -> usize {
+        while self.parent[x] != x {
+            // Path halving: point every other node directly to grandparent.
+            self.parent[x] = self.parent[self.parent[x]];
+            x = self.parent[x];
+        }
+        x
+    }
+
+    fn union(&mut self, x: usize, y: usize) {
+        let rx = self.find(x);
+        let ry = self.find(y);
+        if rx != ry {
+            self.parent[rx] = ry;
+        }
+    }
+}
+
 fn build_components(
     articles: &[SemanticArticle],
     decisions: &[PairDecision],
+    cannot_link: &HashSet<(usize, usize)>,
 ) -> Vec<Vec<usize>> {
-    let mut clusters: Vec<Vec<usize>> = (0..articles.len()).map(|index| vec![index]).collect();
+    let n = articles.len();
+    let mut uf = UnionFind::new(n);
+
     let pair_lookup: HashMap<(usize, usize), &PairDecision> = decisions
         .iter()
         .map(|decision| ((decision.left, decision.right), decision))
         .collect();
 
-    for decision in decisions.iter().filter(|decision| decision.eligible) {
-        let left_cluster = clusters
-            .iter()
-            .position(|members| members.contains(&decision.left));
-        let right_cluster = clusters
-            .iter()
-            .position(|members| members.contains(&decision.right));
-        let (Some(left_cluster), Some(right_cluster)) = (left_cluster, right_cluster) else {
-            continue;
-        };
-        if left_cluster == right_cluster {
+    // Maintain root → members map so coherence checks don't need to scan all
+    // articles; updated on every successful union.
+    let mut members_map: HashMap<usize, Vec<usize>> =
+        (0..n).map(|i| (i, vec![i])).collect();
+
+    for decision in decisions.iter().filter(|d| d.eligible) {
+        // Respect user-split cannot-link constraints: never merge two articles
+        // that the user deliberately separated.
+        let key = (decision.left.min(decision.right), decision.left.max(decision.right));
+        if cannot_link.contains(&key) {
             continue;
         }
-        let mut merged = clusters[left_cluster].clone();
-        merged.extend(clusters[right_cluster].iter().copied());
+
+        let left_root = uf.find(decision.left);
+        let right_root = uf.find(decision.right);
+        if left_root == right_root {
+            continue;
+        }
+
+        // Build proposed merged member list for the coherence check.
+        let left_members = members_map.get(&left_root).cloned().unwrap_or_default();
+        let right_members = members_map.get(&right_root).cloned().unwrap_or_default();
+
+        // Also check that merging the two components wouldn't introduce any
+        // cannot-link pair transitively.
+        let has_forbidden = left_members.iter().any(|&l| {
+            right_members.iter().any(|&r| {
+                let pair = (l.min(r), l.max(r));
+                cannot_link.contains(&pair)
+            })
+        });
+        if has_forbidden {
+            continue;
+        }
+
+        let mut merged = left_members;
+        merged.extend_from_slice(&right_members);
         merged.sort_unstable();
+
         if cluster_is_coherent(&merged, &pair_lookup, articles) {
-            clusters[left_cluster] = merged;
-            clusters.remove(right_cluster);
+            uf.union(left_root, right_root);
+            let new_root = uf.find(left_root);
+            members_map.remove(&left_root);
+            members_map.remove(&right_root);
+            members_map.insert(new_root, merged);
         }
     }
+
+    let mut clusters: Vec<Vec<usize>> = members_map.into_values().collect();
     clusters.sort_by(|a, b| component_key(a, articles).cmp(&component_key(b, articles)));
     clusters
 }
@@ -488,17 +647,15 @@ fn cluster_is_coherent(
     pairs: &HashMap<(usize, usize), &PairDecision>,
     articles: &[SemanticArticle],
 ) -> bool {
-    for (position, &left) in members.iter().enumerate() {
-        for &right in &members[(position + 1)..] {
-            let key = ordered_pair(left, right);
-            let Some(pair) = pairs.get(&key) else {
-                return false;
-            };
-            if pair.veto.is_some() {
-                return false;
-            }
-        }
-    }
+    // Do NOT require every internal pair to exist in the lookup table.
+    // Articles that are >FOLLOW_UP_WINDOW_HOURS apart were never scored, so their
+    // pair is simply absent — that is not a contradiction.  Long-running stories
+    // (court sagas, ongoing inquiries) would otherwise never consolidate.
+    //
+    // Similarly, one vetoed internal pair (e.g. two updates with different death
+    // tolls) should not block a cluster union whose medoid connections are clean.
+    // Only the medoid connections are enforced below.
+
     let Some(medoid) = members.iter().copied().max_by(|&a, &b| {
         average_score(a, members, pairs)
             .partial_cmp(&average_score(b, members, pairs))
@@ -507,11 +664,19 @@ fn cluster_is_coherent(
     }) else {
         return false;
     };
+
+    // Every non-medoid member must either:
+    //   • have a scored, non-vetoed connection to the medoid above MEDOID_THRESHOLD, OR
+    //   • have no scored connection at all (articles too far apart — treat as neutral).
     members.iter().all(|&member| {
-        member == medoid
-            || pairs
-                .get(&ordered_pair(member, medoid))
-                .is_some_and(|pair| pair.score >= MEDOID_THRESHOLD && pair.veto.is_none())
+        if member == medoid {
+            return true;
+        }
+        match pairs.get(&ordered_pair(member, medoid)) {
+            Some(pair) => pair.score >= MEDOID_THRESHOLD && pair.veto.is_none(),
+            // Missing pair = articles outside the scoring window; allow them through.
+            None => true,
+        }
     })
 }
 
@@ -683,7 +848,9 @@ fn persist_plan(
              (article_id_a, article_id_b, algorithm_version, score, decision, reason, components_json)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
         )?;
-        for decision in decisions {
+        // Only persist near-threshold pairs (score ≥ 0.5 or eligible); pairs well
+        // below threshold add no diagnostic value and bloat the table significantly.
+        for decision in decisions.iter().filter(|d| d.eligible || d.score >= 0.50) {
             let accepted = decision.eligible
                 && final_cluster_by_article.get(&decision.left)
                     == final_cluster_by_article.get(&decision.right);
@@ -1049,7 +1216,7 @@ mod tests {
         }
         let decisions = score_pairs(&articles);
         assert!(decisions[0].eligible, "{decisions:#?}");
-        assert_eq!(build_components(&articles, &decisions).len(), 1);
+        assert_eq!(build_components(&articles, &decisions, &HashSet::new()).len(), 1);
     }
 
     #[test]
@@ -1080,7 +1247,7 @@ mod tests {
                 article.embedding = Some(vector);
             }
             let decisions = score_pairs(&articles);
-            let mut groups: Vec<Vec<String>> = build_components(&articles, &decisions)
+            let mut groups: Vec<Vec<String>> = build_components(&articles, &decisions, &HashSet::new())
                 .into_iter()
                 .map(|members| {
                     let mut ids: Vec<_> = members

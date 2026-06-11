@@ -283,7 +283,8 @@ a { text-decoration: none; color: inherit; }
   transition: transform 0.25s var(--lg-ease), box-shadow 0.25s var(--lg-ease), backdrop-filter 0.2s var(--lg-ease);
   cursor: pointer;
 }
-.story-card:focus-visible,
+/* story-card is now <article> — focus ring goes on the inner pressable button */
+.story-card-main:focus-visible,
 .source-headline-row:focus-visible,
 .category-pill:focus-visible,
 .feed-sort-tabs button:focus-visible,
@@ -292,6 +293,7 @@ a { text-decoration: none; color: inherit; }
   outline: 2px solid var(--color-accent);
   outline-offset: 3px;
 }
+/* Press animation fires on the article because click events bubble up from story-card-main */
 .story-card:active {
   transform: scale(0.96);
   backdrop-filter: var(--lg-blur-press);
@@ -299,6 +301,106 @@ a { text-decoration: none; color: inherit; }
   box-shadow: var(--lg-specular), 0 1px 6px rgba(0,0,0,0.06);
 }
 .story-card.skeleton-card { pointer-events: none; }
+
+/* Main pressable area inside the card — reset all button chrome */
+.story-card-main {
+  display: block;
+  width: 100%;
+  text-align: left;
+  background: none;
+  border: none;
+  padding: 0;
+  margin: 0;
+  cursor: pointer;
+  color: inherit;
+  font: inherit;
+}
+
+/* AI-generated headline badge */
+.ai-label {
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.02em;
+  color: var(--color-accent);
+  background: var(--color-accent-soft);
+  border-radius: 4px;
+  padding: 2px 6px;
+  white-space: nowrap;
+  flex-shrink: 0;
+  align-self: flex-start;
+  margin-top: 2px;
+}
+
+/* Compact BiasBar tap target — wider than the 3px bar so it's actually tappable */
+.bias-bar-tap {
+  display: block;
+  width: 100%;
+  background: none;
+  border: none;
+  padding: 5px 0;
+  margin: -5px 0;
+  cursor: pointer;
+}
+
+/* Action toast (split undo + dismiss undo) */
+.action-toast {
+  position: fixed;
+  bottom: calc(env(safe-area-inset-bottom, 0px) + 80px);
+  left: 50%;
+  transform: translateX(-50%);
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  background: var(--material-content);
+  border: 0.5px solid var(--material-content-border);
+  box-shadow: var(--material-content-shadow);
+  border-radius: 999px;
+  padding: 10px 16px;
+  font-size: 13px;
+  font-weight: 500;
+  color: var(--color-label-primary);
+  z-index: 200;
+  white-space: nowrap;
+  animation: fadeInUp 0.22s var(--lg-ease);
+}
+.action-toast button {
+  font-size: 13px;
+  font-weight: 700;
+  color: var(--color-accent);
+  background: none;
+  border: none;
+  padding: 0;
+  cursor: pointer;
+}
+
+/* Inline split confirmation in review sheet */
+.split-confirm-inline {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+}
+.split-confirm-yes {
+  font-size: 13px;
+  font-weight: 700;
+  color: var(--color-destructive, #EF4444);
+  background: none;
+  border: none;
+  padding: 4px 8px;
+  border-radius: 6px;
+  cursor: pointer;
+}
+.split-confirm-no {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--color-label-secondary);
+  background: none;
+  border: none;
+  padding: 4px 8px;
+  border-radius: 6px;
+  cursor: pointer;
+}
+.split-confirm-yes:hover { background: rgba(239,68,68,0.08); }
+.split-confirm-no:hover { background: var(--color-bg-wash); }
 
 .story-card-actions {
   position: absolute;
